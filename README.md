@@ -108,6 +108,7 @@ These receivers are built from the published specifications and checked end to e
 | **Radiosondes** | Weather balloons, 400 – 406 MHz | Balloon tracks, altitude and weather data |
 | **ISM sensors** | 433.92 / 868 / 915 MHz devices (the rtl_433 idea) | Weather stations, tyre pressure sensors, remotes and energy / water meters (wireless M-Bus header): a device table with history, a live log, unknown signals with their pulses |
 | **Cell towers** | LTE downlink broadcast (MIB, SIB1 - SIB5) | Operator, band, EARFCN, PCI, eNB / sector, TAC, neighbours, band scan; receive only |
+| **GSM-R** | Railway GSM broadcast (BCCH, 921 - 925 MHz) | Base stations: ARFCN, BSIC, cell identity, location area, operator code, channel lists; band scan; receive only |
 | **GNSS** | GPS L1 | Satellites, position and time |
 | **Mesh** | Meshtastic and MeshCore (LoRa) | Nodes, map and chat |
 

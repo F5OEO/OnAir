@@ -32,6 +32,7 @@
 #include "vor_tel.h"
 #include "m17_tel.h"
 #include "cell_tel.h"
+#include "gsmr_tel.h"
 #include "t2.h"
 #include "t2l1.h"
 #include "t2plp.h"
@@ -89,6 +90,7 @@ struct RxTelemetry {
     VorTelemetry vor;           // valid when standard == 31
     M17Telemetry m17;           // valid when standard == 32
     CellTelemetry cell;         // valid when standard == 33
+    GsmrTelemetry gsmr;         // valid when standard == 34
     struct Dvbt {                // DVB-T only: TPS parameters and the channel decoder's statistics
         bool tpsOk = false, fecSync = false;
         int mode = 0, guard = 0, mod = 0, hier = 0, crHp = 0, crLp = 0, cellId = 0, frameIdx = 0, punctPhase = 0;

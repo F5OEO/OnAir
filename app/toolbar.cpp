@@ -749,7 +749,7 @@ void gainControl(App& a) {
 
 // The receiver modes. Adding a mode is one row here (and its family number in app.h / setFamily).
 // The families are also stored in the settings: 0 DVB, 1 ATSC, 2 DAB, 3 ATSC 3.0, 4 ISDB-T, 5 FM, 6 DVB-S/S2, 7 DTMB, 8 analog TV, 9 DMR, 10 DRM, 11 ADS-B, 12 GNSS, 13 radiosonde, 14 AIS, 15 marine, 16 ACARS, 17 Inmarsat-C, 18 Inmarsat Aero, 19 Iridium, 20 mesh,
-// 21 HD Radio, 22 CDR, 23 pagers, 24 APRS / packet, 25 HF digital, 26 airband, 27 VDL Mode 2, 28 ISM sensors, 30 VOR / ILS, 31 M17, 32 cell towers.
+// 21 HD Radio, 22 CDR, 23 pagers, 24 APRS / packet, 25 HF digital, 26 airband, 27 VDL Mode 2, 28 ISM sensors, 30 VOR / ILS, 31 M17, 32 cell towers, 33 GSM-R.
 // Within a group the rows are shown in this order; the keys 1-9 pick the modes in the same order.
 const ModeDef kModes[] = {
     {0, "DVB",        0, IM_COL32(52, 92, 108, 255),  "DVB-T2 / DVB-T, detected automatically",                                    "DVB-T2 and DVB-T, automatic (Europe, Middle East, Africa, Asia, Australia)", "T2 and T, automatic",   ImVec4(0.36f, 0.74f, 0.86f, 1)},
@@ -779,6 +779,7 @@ const ModeDef kModes[] = {
     {19, "Iridium", 4, IM_COL32(140, 76, 60, 255), "Iridium satellite bursts around 1622 MHz", "Iridium satellite downlink bursts, needs an L-band antenna", "Satellites, 1622 MHz", ImVec4(0.94f, 0.60f, 0.46f, 1)},
     {12, "GNSS", 4, IM_COL32(130, 112, 52, 255), "GNSS satellites (GPS, GLONASS, BeiDou, Galileo) around 1575 MHz, needs an active antenna", "GNSS: satellite tracking and position fix", "GPS, GLONASS, BeiDou", ImVec4(0.90f, 0.78f, 0.42f, 1)},
     {32, "Cell towers", 7, IM_COL32(70, 96, 130, 255), "LTE cells around you: operator, band, EARFCN, PCI, eNB and sector, TAC, neighbours (receive only, public broadcast)", "Cell towers: the public broadcast information of LTE cells", "LTE, band scan", ImVec4(0.52f, 0.70f, 0.94f, 1), nullptr, "cell tower lte 4g enb earfcn pci operator"},
+    {33, "GSM-R", 7, IM_COL32(110, 84, 70, 255), "Railway GSM base stations (GSM-R, 921 - 925 MHz): cell identity, location area, operator, channel lists (receive only, public broadcast)", "GSM-R: the public broadcast information of railway GSM cells", "Railway, 921 - 925 MHz", ImVec4(0.90f, 0.70f, 0.52f, 1), nullptr, "gsm-r gsmr gsm railway train rail bcch arfcn bsic lac etcs"},
     {28, "ISM sensors", 5, IM_COL32(96, 110, 60, 255), "Everyday 433.92, 868 and 915 MHz devices: weather stations, tyre pressure sensors, remotes, energy and water meters", "ISM sensors: weather stations, TPMS, remotes and meters around you (the rtl_433 idea)", "Sensors, 433 / 868 MHz", ImVec4(0.78f, 0.86f, 0.48f, 1), nullptr, "rtl_433 weather station thermometer tpms tyre tire remote doorbell energy meter m-bus 433 868 915"},
     {13, "Radiosonde", 5, IM_COL32(60, 112, 150, 255), "Weather balloon radiosondes, 400 to 406 MHz (RS41, DFM, M10 and others)", "Radiosonde weather balloons: position, altitude and weather data", "Balloons, 403 MHz", ImVec4(0.46f, 0.74f, 0.94f, 1)},
     {9, "DMR", 5, IM_COL32(70, 120, 70, 255), "DMR two-slot digital voice and data, 12.5 kHz channel", "DMR (Digital Mobile Radio), two-slot TDMA", "Digital voice", ImVec4(0.62f, 0.84f, 0.46f, 1)},
