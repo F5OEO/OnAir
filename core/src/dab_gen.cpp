@@ -399,6 +399,50 @@ struct Transmitter::Impl {
         return fig(1, b);
     }
 
+    // FIG 2 label of idx (0: the ensemble, 1..: the services), UTF-8, in segments that end at a character boundary
+    std::vector<uint8_t> figLabel2(size_t idx, int toggle) const {
+        std::string text = idx == 0 ? cfg.ensembleLabel : subs[idx - 1].svc.label;
+        std::vector<uint8_t> id;
+        int ext = 1;
+        if (idx == 0) { ext = 0; put16(id, cfg.eid); }
+        else if (subs[idx - 1].dmb) { ext = 5; put16(id, subs[idx - 1].svc.sid >> 16); put16(id, subs[idx - 1].svc.sid & 0xFFFF); }
+        else put16(id, subs[idx - 1].svc.sid);
+        std::vector<std::string> parts;
+        for (size_t i = 0; i < text.size();) {
+            size_t n = std::min<size_t>(8, text.size() - i);
+            while (i + n < text.size() && ((uint8_t)text[i + n] & 0xC0) == 0x80) n--;   // do not cut a character
+            parts.push_back(text.substr(i, n));
+            i += n;
+        }
+        std::vector<uint8_t> all;
+        for (size_t s = 0; s < parts.size(); s++) {
+            std::vector<uint8_t> b = {(uint8_t)((toggle << 7) | (int)(s << 4) | ext)};
+            b.insert(b.end(), id.begin(), id.end());
+            if (s == 0) { b.push_back((uint8_t)((parts.size() - 1) << 4)); b.push_back(0); b.push_back(0); }   // UTF-8, segments, character flag field
+            b.insert(b.end(), parts[s].begin(), parts[s].end());
+            const std::vector<uint8_t> f = fig(2, b);
+            all.insert(all.end(), f.begin(), f.end());
+        }
+        return all;
+    }
+
+    std::vector<uint8_t> fig017() const {                  // programme type of the audio services, English
+        std::vector<uint8_t> b{0x11};
+        for (const auto& sb : subs) if (!sb.dmb) { put16(b, sb.svc.sid); b.push_back((uint8_t)((cfg.ptyDynamic ? 0x80 : 0) | 0x20)); b.push_back(9); b.push_back((uint8_t)cfg.pty); }
+        return fig(0, b);
+    }
+    std::vector<uint8_t> fig018() const {                  // announcement support of the audio services
+        std::vector<uint8_t> b{0x12};
+        for (const auto& sb : subs) if (!sb.dmb) { put16(b, sb.svc.sid); put16(b, cfg.annSupport); b.push_back(1); b.push_back((uint8_t)cfg.annCluster); }
+        return fig(0, b);
+    }
+    std::vector<uint8_t> fig019() const {                  // announcement switching
+        std::vector<uint8_t> b{0x13, (uint8_t)cfg.annCluster};
+        put16(b, cfg.annActive);
+        b.push_back((uint8_t)(0x80 | (cfg.annSubId & 0x3F)));
+        return fig(0, b);
+    }
+
     void makeFibs(uint64_t m, uint8_t out[12][32]) const {
         std::vector<uint8_t> fib[12];
         auto place = [&](int from, const std::vector<uint8_t>& f) {
@@ -411,8 +455,17 @@ struct Transmitter::Impl {
         for (const auto& f : fig01()) place(1, f);
         for (const auto& f : fig02()) place(1, f);
         for (const auto& f : fig013()) place(1, f);
+        if (cfg.pty >= 0 && subs.size() <= 8) place(1, fig017());
+        if (cfg.annCluster > 0 && subs.size() <= 6) { place(1, fig018()); if (cfg.annActive) place(0, fig019()); }
         const size_t nl = subs.size() + 1;
-        for (size_t k = 0; k < 3; k++) place(1, figLabel((size_t)((m * 3 + k) % nl)));
+        for (size_t k = 0; k < 3; k++) {
+            const size_t idx = (size_t)((m * 3 + k) % nl);
+            if (!cfg.utf8Labels) place(1, figLabel(idx));
+            else {   // the segments of a label travel together, in one FIB
+                const std::vector<uint8_t> f = figLabel2(idx, 0);
+                if (f.size() <= 30) place(1, f);
+            }
+        }
         for (int i = 0; i < 12; i++) {
             std::memset(out[i], 0, 32);
             std::memcpy(out[i], fib[i].data(), fib[i].size());

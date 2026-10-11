@@ -217,7 +217,27 @@ struct App {
     bool lightUi = false;     // View > Light: every colour drawn with its lightness turned over (dark on white), hues kept (main.cpp)
     int family = 0;           // 0 DVB, 1 ATSC, 2 DAB, 3 ATSC 3.0, 4 ISDB-T, 5 FM, 6 DVB-S/S2, 7 DTMB, 8 analog TV, 9 DMR, 10 DRM, 11 ADS-B, 12 GNSS, 13 radiosonde, 14 AIS, 15 marine, 16 ACARS, 17 Inmarsat-C, 18 Inmarsat Aero, 19 Iridium, 20 mesh, 21 HD Radio, 22 CDR, 23 pagers, 24 APRS / packet, 25 HF digital, 26 airband, 27 VDL Mode 2, 28 ISM sensors, 30 VOR / ILS, 31 M17, 33 D-STAR, 34 CW, 35 HFDL, 38 NXDN (6 and up: see ModeUi; engine standard code = family + 2)
     int sub = 0;              // 1 .. kNumSubModes: the protocol entry (dect2::subModes() index + 1) of HF digital, mesh, pagers, marine or VOR / ILS; 0 none
-    std::deque<float> dabSnrH, dabFicH;
+    std::deque<float> dabSnrH, dabFicH, dabCfoH, dabCirH;
+    std::deque<float> dabBufH, dabRsH, dabAuH;   // of the selected service: they restart when another one is selected
+    int dabHistSub = -2;
+    // announcements (EN 300 401 8.1.6): switch to the sub-channel that carries one while it lasts
+    bool dabAnnOn = true; unsigned dabAnnMask = 0x3F;   // types 0..5: alarm, road traffic, transport, warning, news, weather
+    int dabUserSub = -1;                                // the sub-channel the user chose (what is played when there is no announcement)
+    bool dabAnnActive = false, dabAnnSuspended = false; // switched to an announcement; the user went back to the service until it ends
+    int dabAnnSub = -1, dabAnnType = -1;
+    double dabAnnLastSwitch = -1e9;                     // time of the last switch to or from an announcement: at most one every 5 s
+    bool dabPrefsLoaded = false;
+    int dabRecFmt = 0; bool dabRecLog = true;           // recording: 0 WAV, 1 as broadcast
+    std::string dabRecErr;
+    // following: when the signal is lost, the service is looked for on the other frequencies the FIC lists for its ensemble (FIG 0/21) and for the
+    // other ensembles that carry it (FIG 0/24)
+    bool dabFollow = false;
+    std::vector<std::pair<double, uint16_t>> dabAlts;   // MHz, ensemble id
+    double dabAltStamp = 0, dabLostSince = 0, dabFollowT0 = 0;
+    int dabFollowIdx = 0;
+    uint32_t dabFollowSid = 0;
+    bool dabFollowing = false;
+    uint64_t dabRsLast = 0, dabAuLast = 0;
     std::deque<float> fmSnrH, fmPilotH, fmRdsH;
     int fmDeemph = 50;        // FM de-emphasis in microseconds: 50 (Europe, Middle East, most of the world) or 75 (Americas, South Korea)
     int fmChanKhz = 0;        // FM channel filter: 0 = automatic (the receiver's standard 220 kHz), else a manual width of 100 to 300 kHz
@@ -617,6 +637,10 @@ void dabSelectStation(App& a, int sub, bool play);
 void dabStations(App& a);
 void dabRadioTab(App& a);
 void dabEnsembleTab(App& a);
+void dabTuneMhz(App& a, double mhz);   // dab_ui.cpp: tunes the running receiver to a DAB frequency
+void dabSlidePanel(App& a, const DabEnsemble& ens, float maxH);   // dab_ui.cpp: the latest slide show picture with its name
+void dabAnalyzerTab(App& a);       // dab_analyzer_ui.cpp: the ensemble as a tree with details and the MSC allocation
+void dabFicTab(App& a);            // dab_fic_ui.cpp: the FIC, FIG by FIG, as a tree
 void dabTransmittersTab(App& a);   // dab_tii_ui.cpp: the TII transmitters, on a map with a transmitter list
 void dabScanTab(App& a);
 void dabScanStep(App& a);

@@ -50,9 +50,21 @@ bool decodeSlideImage(const uint8_t* data, size_t n, int subtype, int& w, int& h
     return ok;
 }
 
+const char* dabDlpTypeName(int t) {
+    static const char* const n[] = {"Dummy", "Title", "Album", "Track number", "Artist", "Composition", "Movement", "Conductor", "Composer", "Band", "Comment",
+        "Genre", "News", "Local news", "Stock market", "Sport", "Lottery", "Horoscope", "Daily diversion", "Health", "Event", "Scene", "Cinema", "TV",
+        "Date and time", "Weather", "Traffic", "Alarm", "Advertisement", "URL", "Other info", "Station name (short)", "Station name (long)",
+        "Programme now", "Programme next", "Programme part", "Host", "Editorial staff", "Programme frequency", "Programme homepage", "Programme sub-channel",
+        "Hotline phone", "Studio phone", "Phone", "Studio SMS", "SMS", "Hotline e-mail", "Studio e-mail", "E-mail", "MMS", "Chat", "Chat centre",
+        "Vote question", "Vote centre"};
+    if (t >= 0 && t < (int)(sizeof n / sizeof *n)) return n[t];
+    return t >= 56 && t <= 58 ? "Private" : "Reserved";
+}
+
 void DabPadDecoder::reset() {
-    lastType_ = 0; group_.clear(); groupLen_ = 0; collecting_ = false;
+    lastCont_ = 0; lastType_ = 0; group_.clear(); groupLen_ = 0; collecting_ = false;
     dls_.clear(); dlsOn_ = false; dlsToggle_ = -1; dlsParts_.clear(); dlsLast_ = -1; label_.clear();
+    labelChars_.clear(); dlpRaw_.clear(); dlpToggle_ = -1; dlpRunning_ = false; dlp_.clear();
     objs_.clear(); order_.clear();
     slide_ = DabSlide();
 }
@@ -67,6 +79,33 @@ void DabPadDecoder::accessUnit(const uint8_t* au, int n) {
     std::vector<uint8_t> x((size_t)cnt - 2);
     for (int k = 0; k < cnt - 2; k++) x[(size_t)k] = d[cnt - 3 - k];
     pad(x.data(), cnt - 2, fpad);
+}
+
+void DabPadDecoder::mp2Frame(const uint8_t* f, int len) {
+    if (len < 8) return;
+    const uint8_t fpad[2] = {f[len - 2], f[len - 1]};
+    if ((fpad[0] >> 6) != 0) return;
+    const int ind = (fpad[0] >> 4) & 3;
+    const bool ci = (fpad[1] & 2) != 0;
+    int xlen = 0;
+    if (ind == 1) { xlen = 4; if (ci) lastCont_ = 3; }
+    else if (ind == 2) {
+        if (ci) {   // the sizes of the subfields are in the content indicators, the bytes next to the F-PAD
+            int i = 0, tot = 0;
+            for (; i < 4 && i < len - 3; i++) {
+                const int t = f[len - 3 - i] & 0x1F;
+                if (t == 0) { i++; break; }
+                lastCont_ = kSubfieldLen[f[len - 3 - i] >> 5];
+                tot += lastCont_;
+            }
+            xlen = i + tot;
+        } else xlen = lastCont_;
+    }
+    xlen = std::min(xlen, len - 6);
+    if (xlen <= 0) return;
+    std::vector<uint8_t> xp((size_t)xlen);
+    for (int k = 0; k < xlen; k++) xp[(size_t)k] = f[len - 3 - k];
+    pad(xp.data(), xlen, fpad);
 }
 
 void DabPadDecoder::pad(const uint8_t* xp, int xlen, const uint8_t fpad[2]) {
@@ -116,10 +155,21 @@ void DabPadDecoder::subfield(int type, const uint8_t* d, int n) {
         if (!dlsOn_) return;
         dls_.insert(dls_.end(), d, d + n);
         if (dls_.size() >= 2) {
-            const int total = 2 + ((dls_[0] & 0x10) ? 0 : (dls_[0] & 0x0F) + 1) + 2;
-            if ((int)dls_.size() >= total) {
-                dlsOn_ = false;
-                if (dab::crc16(dls_.data(), total - 2) == (uint16_t)((dls_[total - 2] << 8) | dls_[total - 1])) labelSegment(dls_.data(), total - 2);
+            if (!(dls_[0] & 0x10)) {
+                const int total = 2 + (dls_[0] & 0x0F) + 1 + 2;
+                if ((int)dls_.size() >= total) {
+                    dlsOn_ = false;
+                    if (dab::crc16(dls_.data(), total - 2) == (uint16_t)((dls_[total - 2] << 8) | dls_[total - 1])) labelSegment(dls_.data(), total - 2);
+                }
+            } else {   // a command: the clear command has no data, the others (DL Plus) a few bytes: the length is the one the CRC agrees with
+                int found = -1;
+                const int most = (dls_[0] & 0x0F) == 1 ? 0 : 16;
+                for (int l = 0; l <= most && found < 0; l++) {
+                    const int total = 2 + l + 2;
+                    if ((int)dls_.size() >= total && dab::crc16(dls_.data(), total - 2) == (uint16_t)((dls_[total - 2] << 8) | dls_[total - 1])) found = total;
+                }
+                if (found > 0) { dlsOn_ = false; labelSegment(dls_.data(), found - 2); }
+                else if ((int)dls_.size() >= 2 + most + 2) dlsOn_ = false;
             }
         }
         return;
@@ -142,7 +192,12 @@ void DabPadDecoder::subfield(int type, const uint8_t* d, int n) {
 void DabPadDecoder::labelSegment(const uint8_t* d, int n) {
     const int toggle = d[0] >> 7;
     const bool first = d[0] & 0x40, last = d[0] & 0x20, cmd = d[0] & 0x10;
-    if (cmd) { if ((d[0] & 0x0F) == 1) { label_.clear(); dlsParts_.clear(); dlsLast_ = -1; } return; }   // command 1: clear the display
+    if (cmd) {
+        const int code = d[0] & 0x0F;
+        if (code == 1) { label_.clear(); labelChars_.clear(); dlsParts_.clear(); dlsLast_ = -1; dlp_.clear(); dlpRaw_.clear(); }   // command 1: clear the display
+        else if (code == 2) dlPlusCommand(toggle, d + 2, n - 2);
+        return;
+    }
     const int segNo = first ? 0 : (d[1] >> 4) & 7;
     if (toggle != dlsToggle_ || (first && !dlsParts_.empty() && dlsParts_.count(0) && dlsParts_[0] != std::vector<uint8_t>(d + 2, d + n))) {
         dlsParts_.clear(); dlsLast_ = -1; dlsToggle_ = toggle;     // a new label
@@ -154,6 +209,42 @@ void DabPadDecoder::labelSegment(const uint8_t* d, int n) {
     std::vector<uint8_t> all;
     for (auto& kv : dlsParts_) { if (kv.first > dlsLast_) return; all.insert(all.end(), kv.second.begin(), kv.second.end()); }
     label_ = text::clean(text::dabCharset(dlsCharset_, all.data(), all.size()));
+    // the characters one by one, for the DL Plus tags
+    labelChars_.clear();
+    for (size_t i = 0; i < all.size();) {
+        size_t w = 1;
+        if (dlsCharset_ == 6) w = 2;
+        else if (dlsCharset_ == 15) { const uint8_t b = all[i]; w = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1; }
+        w = std::min(w, all.size() - i);
+        labelChars_.push_back(text::dabCharset(dlsCharset_, &all[i], w));
+        i += w;
+    }
+    resolveDlPlus();
+}
+
+// DL Plus tags command (TS 102 980 clause 5.3): item toggle, item running, number of tags - 1, then per tag the content type, the start and the
+// length - 1 in characters of the label, 7 bits each
+void DabPadDecoder::dlPlusCommand(int toggle, const uint8_t* d, int n) {
+    if (n < 1) return;
+    const int nt = (d[0] & 3) + 1;
+    if (n < 1 + 3 * nt) return;
+    dlpRaw_.clear();
+    for (int i = 0; i < nt; i++) dlpRaw_.push_back({d[1 + 3 * i] & 0x7F, d[2 + 3 * i] & 0x7F, (d[3 + 3 * i] & 0x7F) + 1});
+    dlpRunning_ = (d[0] >> 2) & 1;
+    dlpToggle_ = toggle;
+    resolveDlPlus();
+}
+
+void DabPadDecoder::resolveDlPlus() {
+    dlp_.clear();
+    if (dlpToggle_ != dlsToggle_ || label_.empty()) return;
+    for (const RawTag& t : dlpRaw_) {
+        if (t.type == 0 || t.start + t.len > (int)labelChars_.size()) continue;
+        std::string s;
+        for (int i = t.start; i < t.start + t.len; i++) s += labelChars_[(size_t)i];
+        s = text::clean(s);
+        if (!s.empty()) dlp_.push_back({t.type, s});
+    }
 }
 
 void DabPadDecoder::dataGroup(const uint8_t* d, int n) {

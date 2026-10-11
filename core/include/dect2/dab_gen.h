@@ -94,6 +94,16 @@ struct TxConfig {
     // against the main signal (0 = as strong as a data carrier). Empty: no TII.
     struct Tii { int mainId = 0, subId = 0; double levelDb = 0; };
     std::vector<Tii> tii;
+    // Announcements: every service supports the types `annSupport` (ASu flags) on the cluster `annCluster` (FIG 0/18); while `annActive` is not
+    // 0 the cluster announces those types (ASw flags) on sub-channel `annSubId` (FIG 0/19). annCluster 0: none.
+    int annCluster = 0;
+    unsigned annSupport = 0, annActive = 0;
+    int annSubId = -1;
+    // FIG 0/17: the programme type of every service (-1: none), dynamic when `ptyDynamic`
+    int pty = -1;
+    bool ptyDynamic = false;
+    // Labels as FIG 2 (UTF-8, in segments of at most 8 bytes) instead of FIG 1: the label strings may then hold any text
+    bool utf8Labels = false;
 };
 // 1 "OnAir Tones 1" DAB+ 48 kHz 1 kHz / 3 kHz, 48 kbit/s; 2 "OnAir Tones 2" DAB+ 32 kHz 2 kHz / 500 Hz, 32 kbit/s; 3 "OnAir Melody" DAB+ 48 kHz, 64 kbit/s;
 // 4 "OnAir MP2" DAB 48 kHz 1.5 kHz / 750 Hz, 128 kbit/s (left out when libavcodec has no MP2 encoder)

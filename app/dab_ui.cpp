@@ -1,5 +1,9 @@
 // DAB / DAB+ digital radio panels.
 #include "app.h"
+#include "dect2/dab_announce.h"
+#include "dect2/dab_fig.h"
+#include <ctime>
+#include <filesystem>
 
 // DAB / DAB+ screens (included by main.cpp): channel plan, status lines, constellation panels, station list and player,
 // the Radio and Ensemble tabs, and the Band III scanner.
@@ -114,18 +118,145 @@ void dabStatus(App& a) {
     } else flowBreak();
 }
 
+// ------------------------------------------------------------------ selection and announcements
+static void dabPrefs(App& a) {
+    if (a.dabPrefsLoaded) return;
+    a.dabPrefsLoaded = true;
+    a.dabAnnOn = plat::prefs().getB("dabAnnOn", true);
+    a.dabAnnMask = (unsigned)plat::prefs().getI("dabAnnMask", 0x3F);
+    a.dabRecFmt = (int)plat::prefs().getI("dabRecFmt", 0);
+    a.dabRecLog = plat::prefs().getB("dabRecLog", true);
+    a.dabFollow = plat::prefs().getB("dabFollow", false);
+}
+
+static void dabPlaySub(App& a, int sub) {
+    a.engine.dabSelect(sub);
+    a.engine.dabAudio().setVolume(a.volume);
+    a.engine.dabAudio().setMuted(a.muted);
+    a.engine.player().setVolume(a.volume);   // DMB video services play through the player
+    a.engine.player().setMuted(a.muted);
+}
+
+void dabTuneMhz(App& a, double mhz) {
+    a.freqMhz = mhz;
+    a.tune.centerHz = a.freqMhz * 1e6;
+    a.engine.retuneReset(a.tune);
+    a.peak.clear();
+}
+
+// Signal lost for a few seconds: tune to the frequencies the ensemble gives for itself, and for the other ensembles that carry the service,
+// one after the other, and play the service again where it is found (the sub-channel may have another number there)
+static void dabFollowStep(App& a) {
+    if (!a.dabFollow || !a.dabMode || !a.engine.running() || a.dabScan.running || a.dabUserSub < 0) { a.dabFollowing = false; a.dabLostSince = 0; return; }
+    const double now = ImGui::GetTime();
+    const bool locked = a.rx.standard == 3 && a.rx.dab.state == 2 && a.rx.dab.ensemble;
+    auto next = [&] {
+        if (a.dabAlts.empty()) return;
+        const auto alt = a.dabAlts[(size_t)a.dabFollowIdx++ % a.dabAlts.size()];
+        char b[96]; snprintf(b, sizeof b, "DAB: signal lost, trying %s %.3f MHz", dabChannelName(alt.first) ? dabChannelName(alt.first) : "", alt.first);
+        a.engine.log(b);
+        dabTuneMhz(a, alt.first);
+        a.dabFollowing = true; a.dabFollowT0 = now; a.dabLostSince = now;
+    };
+    if (!locked) {
+        if (a.dabLostSince == 0) a.dabLostSince = now;
+        if (now - a.dabLostSince >= 6.0) next();
+        return;
+    }
+    a.dabLostSince = 0;
+    const DabEnsemble ens = a.engine.dabEnsemble();
+    if (a.dabFollowing) {   // arrived somewhere: is the service here?
+        for (const auto& kv : ens.services) {
+            if (kv.first != a.dabFollowSid) continue;
+            const DabComponent* c = kv.second.playable();
+            if (!c) continue;
+            a.dabFollowing = false;
+            a.dabUserSub = c->subId;
+            dabPlaySub(a, c->subId);
+            a.engine.log("DAB: service found again");
+            return;
+        }
+        if (ens.valid && now - a.dabFollowT0 > 12.0) next();   // another ensemble that does not have it: the next frequency
+        return;
+    }
+    if (now - a.dabAltStamp < 5.0) return;
+    a.dabAltStamp = now;
+    const DabFicInfo info = dabFicInfo(a.engine.dabFic());
+    a.dabFollowSid = 0;
+    for (const auto& kv : ens.services) for (const auto& c : kv.second.comps) if (c.subId == a.dabUserSub) a.dabFollowSid = kv.first;
+    std::vector<uint16_t> eids = {ens.eid};
+    const auto oe = info.otherEnsembles.find(a.dabFollowSid);
+    if (oe != info.otherEnsembles.end()) eids.insert(eids.end(), oe->second.begin(), oe->second.end());
+    std::vector<std::pair<double, uint16_t>> alts;
+    for (const auto& f : info.freqs) {
+        if ((f.rm != 0 && f.rm != 1) || std::find(eids.begin(), eids.end(), (uint16_t)f.id) == eids.end()) continue;
+        for (double khz : f.kHz) {
+            const double mhz = khz / 1000.0;
+            if (std::fabs(mhz - a.freqMhz) < 0.01 || !dabChannelName(mhz)) continue;
+            bool dup = false;
+            for (const auto& x : alts) if (std::fabs(x.first - mhz) < 0.01) dup = true;
+            if (!dup) alts.push_back({mhz, (uint16_t)f.id});
+        }
+    }
+    a.dabAlts = alts;
+}
+
+// While an announcement the user wants is on, the sub-channel that carries it is played; when it ends the service comes back
+static void dabAnnouncementStep(App& a) {
+    if (!a.dabMode || !a.engine.running()) { a.dabAnnActive = false; return; }
+    const unsigned mask = a.dabAnnOn ? a.dabAnnMask : 0;
+    const double now = ImGui::GetTime();
+    const bool settled = now - a.dabAnnLastSwitch >= 5.0;   // a switch restarts the audio decoder: not more often than every 5 seconds
+    auto go = [&](int sub, const char* what) {
+        a.dabAnnLastSwitch = now;
+        char b[96]; snprintf(b, sizeof b, "DAB announcement: %s, sub-channel %d", what, sub);
+        a.engine.log(b);
+        dabPlaySub(a, sub);
+    };
+    auto back = [&] { if (a.dabAnnActive && settled) { a.dabAnnActive = false; go(a.dabUserSub, "back to the station"); } };
+    if (a.dabUserSub < 0 || !mask) { if (a.dabAnnActive) { a.dabAnnActive = false; dabPlaySub(a, a.dabUserSub); } a.dabAnnSuspended = false; return; }
+    DabAnnouncement an;
+    const bool have = dabActiveAnnouncement(a.engine.dabEnsemble(), a.dabUserSub, mask, an);
+    if (!have) { back(); if (!a.dabAnnActive) a.dabAnnSuspended = false; return; }
+    if (a.dabAnnSuspended || !settled) return;
+    if (!a.dabAnnActive || an.subId != a.dabAnnSub) {
+        a.dabAnnActive = true; a.dabAnnSub = an.subId; a.dabAnnType = an.type;
+        go(an.subId, dabAnnouncementTypeName(an.type));
+    }
+}
+
 // ------------------------------------------------------------------ constellation row
 void dabHistory(App& a) {
+    dabPrefs(a);
+    dabFollowStep(a);
     if (a.dabStation >= 0 && a.dabMode && a.engine.running()) {
         a.engine.dabSelect(a.dabStation); a.engine.dabAudio().setVolume(a.volume);
         a.engine.player().setVolume(a.volume); a.engine.player().setMuted(a.muted);   // a DMB video service plays through the player
+        a.dabUserSub = a.dabStation; a.dabAnnActive = false;
         a.dabStation = -1;
     }
     static uint64_t lastSeq = 0;
     if (a.rx.standard != 3 || a.rx.seq == lastSeq) return;
     lastSeq = a.rx.seq;
+    dabAnnouncementStep(a);
     auto push = [](std::deque<float>& dq, float v) { dq.push_back(v); if (dq.size() > 600) dq.pop_front(); };
-    if (a.rx.dab.state == 2) { push(a.dabSnrH, (float)a.rx.dab.snrDb); push(a.dabFicH, (float)a.rx.dab.ficRecentOk); }
+    if (a.rx.dab.state == 2) {
+        push(a.dabSnrH, (float)a.rx.dab.snrDb); push(a.dabFicH, (float)a.rx.dab.ficRecentOk);
+        push(a.dabCfoH, (float)a.rx.dab.cfoHz); push(a.dabCirH, a.rx.dab.cirPeak);
+    }
+    // the measures of the selected service start again when another one is selected
+    const DabAudioStats& au = a.rx.dab.audio;
+    if (au.sub != a.dabHistSub) {
+        a.dabHistSub = au.sub;
+        a.dabBufH.clear(); a.dabRsH.clear(); a.dabAuH.clear();
+        a.dabRsLast = au.rsCorrected; a.dabAuLast = au.auBad;
+    }
+    if (au.sub >= 0 && a.rx.dab.state == 2) {
+        push(a.dabBufH, (float)au.bufferedMs);
+        push(a.dabRsH, (float)(au.rsCorrected >= a.dabRsLast ? au.rsCorrected - a.dabRsLast : 0));
+        push(a.dabAuH, (float)(au.auBad >= a.dabAuLast ? au.auBad - a.dabAuLast : 0));
+        a.dabRsLast = au.rsCorrected; a.dabAuLast = au.auBad;
+    }
 }
 
 void dabPanels(App& a) {
@@ -196,13 +327,10 @@ std::string dabSubText(const DabEnsemble& e, int sub) {
 }
 
 void dabSelectStation(App& a, int sub, bool play) {
-    if (play) {
-        a.engine.dabSelect(sub);
-        a.engine.dabAudio().setVolume(a.volume);
-        a.engine.dabAudio().setMuted(a.muted);
-        a.engine.player().setVolume(a.volume);   // DMB video services play through the player
-        a.engine.player().setMuted(a.muted);
-    } else a.engine.dabSelect(-1);
+    a.dabUserSub = play ? sub : -1;
+    a.dabAnnActive = false; a.dabAnnSuspended = false;
+    if (play) dabPlaySub(a, sub);
+    else a.engine.dabSelect(-1);
 }
 
 // The slide show picture the selected DAB+ service sends in its PAD: kept as a texture while the picture lasts
@@ -223,6 +351,127 @@ static void dabSlideUpdate(App& a) {
     gDabSlide.img->update(0, 0, s.w, s.h, reinterpret_cast<const uint32_t*>(s.rgba.data()));
     gDabSlide.w = s.w; gDabSlide.h = s.h; gDabSlide.name = s.name;
 }
+// The latest slide show picture of the playing service with the name it came with (and the label), in a box at most `maxH` high
+static std::string dlPlusShort(const DabService& sv);
+void dabSlidePanel(App& a, const DabEnsemble& ens, float maxH) {
+    dabSlideUpdate(a);
+    const int cur = a.engine.dabSelected();
+    std::string dls, title;
+    for (const auto& kv : ens.services) {
+        const DabComponent* c = kv.second.playable();
+        if (c && c->subId == cur) { dls = kv.second.dls; title = dlPlusShort(kv.second); }
+    }
+    if (cur < 0 || !gDabSlide.img) {
+        ImGui::TextDisabled(cur < 0 ? "no service playing" : "no picture received yet (not every station sends one)");
+        return;
+    }
+    const float bw = ImGui::GetContentRegionAvail().x;
+    const float sc = std::max(0.1f, std::min(std::min(bw / (float)gDabSlide.w, maxH / (float)gDabSlide.h), 6.f));
+    ImGui::Image(gDabSlide.img->texture(), ImVec2((float)gDabSlide.w * sc, (float)gDabSlide.h * sc));
+    ImGui::SameLine(0, 10 * gUi);
+    ImGui::BeginGroup();
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + std::max(120.f * gUi, bw - (float)gDabSlide.w * sc - 14 * gUi));
+    if (!gDabSlide.name.empty()) ImGui::TextUnformatted(gDabSlide.name.c_str());
+    ImGui::TextDisabled("%d x %d", gDabSlide.w, gDabSlide.h);
+    if (!title.empty()) ImGui::TextUnformatted(title.c_str());
+    else if (!dls.empty()) ImGui::TextDisabled("%s", dls.c_str());
+    ImGui::PopTextWrapPos();
+    ImGui::EndGroup();
+}
+
+// The DL Plus tags of a service as lines: "Title", "Artist", "Album" first, the others after them
+static void dlPlusLines(const DabService& sv, std::vector<std::pair<std::string, std::string>>& out) {
+    for (int want : {1, 4, 2}) for (const DabDlpTag& t : sv.dlPlus) if (t.type == want) out.push_back({dabDlpTypeName(t.type), t.text});
+    for (const DabDlpTag& t : sv.dlPlus) if (t.type != 1 && t.type != 4 && t.type != 2) out.push_back({dabDlpTypeName(t.type), t.text});
+}
+
+// "Artist - Title" when the station tags them
+static std::string dlPlusShort(const DabService& sv) {
+    std::string ar, ti;
+    for (const DabDlpTag& t : sv.dlPlus) { if (t.type == 4 && ar.empty()) ar = t.text; if (t.type == 1 && ti.empty()) ti = t.text; }
+    return ar.empty() ? ti : ti.empty() ? ar : ar + " - " + ti;
+}
+
+// What the service says about its programme: type (dynamic or fixed) and language
+static std::string programmeText(const DabEnsemble& ens, const DabService& sv) {
+    std::string s;
+    if (sv.pty >= 0) s = std::string(dabPtyName(1, sv.pty)) + (sv.ptyDynamic ? " (now)" : "");
+    if (sv.language > 0) s += (s.empty() ? "" : "   ") + std::string(dabLanguageName(sv.language));
+    (void)ens;
+    return s;
+}
+
+static void dabRecordUi(App& a, const DabEnsemble& ens) {
+    const DabRecStats rs = a.engine.dabAudio().recording();
+    const DabAudioStats au = a.rx.dab.audio;
+    sectionHeader(Ic::Record, "Recording");
+    if (!rs.active) {
+        ImGui::BeginDisabled(au.sub < 0);
+        if (ImGui::Button("Record")) {
+            std::string name = "dab";
+            for (const auto& kv : ens.services) { const DabComponent* c = kv.second.playable(); if (c && c->subId == au.sub) name = kv.second.label; }
+            for (char& c : name) if (!(std::isalnum((unsigned char)c) || c == '-' || c == '_' || (unsigned char)c >= 0x80)) c = '_';
+            const std::time_t now = std::time(nullptr);
+            char ts[32];
+            std::strftime(ts, sizeof ts, "%Y%m%d_%H%M%S", std::localtime(&now));
+            std::error_code ec;
+            const std::string dir = plat::dataDir() + "/dab-recordings";
+            std::filesystem::create_directories(dir, ec);
+            std::string err;
+            if (!a.engine.dabAudio().startRecording(dir + "/" + name + "_" + ts, a.dabRecFmt ? DabRecFormat::Encoded : DabRecFormat::Wav, a.dabRecLog, &err)) a.dabRecErr = err;
+            else a.dabRecErr.clear();
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(130 * gUi);
+        if (ImGui::Combo("##recfmt", &a.dabRecFmt, "WAV (decoded)\0As broadcast (m4a / mp2)\0")) plat::prefs().setI("dabRecFmt", a.dabRecFmt);
+        {
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Label log", &a.dabRecLog)) plat::prefs().setB("dabRecLog", a.dabRecLog);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Also write the dynamic labels, with the time, to a text file beside the recording");
+        }
+        if (!rs.error.empty()) { ImGui::PushTextWrapPos(0); ImGui::TextColored(pal::badRed(), "stopped: %s", rs.error.c_str()); ImGui::PopTextWrapPos(); }
+        if (!a.dabRecErr.empty()) { ImGui::PushTextWrapPos(0); ImGui::TextColored(pal::badRed(), "%s", a.dabRecErr.c_str()); ImGui::PopTextWrapPos(); }
+        if (au.sub < 0) ImGui::TextDisabled("play a DAB or DAB+ station to record it");
+    } else {
+        if (ImGui::Button("Stop")) a.engine.dabAudio().stopRecording();
+        ImGui::SameLine();
+        const int sec = (int)rs.seconds;
+        ImGui::Text("%02d:%02d   %.1f MB", sec / 60, sec % 60, (double)rs.bytes / 1e6);
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("%s", rs.path.c_str());
+        ImGui::PopTextWrapPos();
+    }
+}
+
+static void dabAnnouncementUi(App& a, const DabEnsemble& ens) {
+    if (ImGui::Checkbox("Switch to announcements", &a.dabAnnOn)) plat::prefs().setB("dabAnnOn", a.dabAnnOn);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("types...")) ImGui::OpenPopup("dabanntypes");
+    if (ImGui::BeginPopup("dabanntypes")) {
+        for (int t = 0; t < kDabAnnTypes; t++) {
+            bool on = (a.dabAnnMask >> t) & 1;
+            if (ImGui::Checkbox(dabAnnouncementTypeName(t), &on)) { a.dabAnnMask = on ? (a.dabAnnMask | (1u << t)) : (a.dabAnnMask & ~(1u << t)); plat::prefs().setI("dabAnnMask", (long)a.dabAnnMask); }
+        }
+        ImGui::EndPopup();
+    }
+    if (ImGui::Checkbox("Follow to other frequencies", &a.dabFollow)) plat::prefs().setB("dabFollow", a.dabFollow);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("When the signal is lost for a few seconds, look for the station on the other frequencies of its ensemble and on the other ensembles that carry it (frequency information of the broadcast)");
+    if (a.dabFollowing) { ImGui::PushTextWrapPos(0); ImGui::TextColored(pal::warnAmber(), "signal lost: looking on other frequencies"); ImGui::PopTextWrapPos(); }
+    else if (a.dabFollow && !a.dabAlts.empty()) ImGui::TextDisabled("%zu alternative frequencies known", a.dabAlts.size());
+    if (a.dabAnnActive) {
+        std::string who = "sub-channel " + std::to_string(a.dabAnnSub);
+        for (const auto& kv : ens.services) for (const auto& c : kv.second.comps) if (c.subId == a.dabAnnSub) who = kv.second.label;
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextColored(pal::warnAmber(), "%s: %s", dabAnnouncementTypeName(a.dabAnnType), who.c_str());
+        ImGui::PopTextWrapPos();
+        if (ImGui::SmallButton("Back to the station")) {
+            a.dabAnnSuspended = true; a.dabAnnActive = false;
+            dabPlaySub(a, a.dabUserSub);
+        }
+    } else if (a.dabAnnSuspended) ImGui::TextDisabled("announcement skipped");
+}
+
 void dabStations(App& a) {
     const bool run = a.engine.running();
     const DabEnsemble ens = a.engine.dabEnsemble();
@@ -254,7 +503,7 @@ void dabStations(App& a) {
             x += tagAt(dl, ImVec2(x, ty), ac->dmb() ? "DMB" : sv->dabPlus() ? "DAB+" : "DAB", IM_COL32(34, 74, 108, 255)) + 4;
             auto it = ens.subs.find(ac->subId);
             if (it != ens.subs.end() && it->second.bitrate > 0) { char k[24]; snprintf(k, sizeof k, "%d kbit/s", it->second.bitrate); x += tagAt(dl, ImVec2(x, ty), k, IM_COL32(38, 46, 58, 255), IM_COL32(190, 200, 214, 255)) + 4; }
-            if (it != ens.subs.end() && !it->second.eep) tagAt(dl, ImVec2(x, ty), "UEP: not supported yet", IM_COL32(112, 52, 50, 255));
+            if (it != ens.subs.end() && !it->second.eep) tagAt(dl, ImVec2(x, ty), "UEP", IM_COL32(38, 46, 58, 255), IM_COL32(190, 200, 214, 255));
         } else tagAt(dl, ImVec2(x, ty), "data", IM_COL32(38, 46, 58, 255), IM_COL32(190, 200, 214, 255));
         ImGui::PopID();
     }
@@ -294,6 +543,21 @@ void dabStations(App& a) {
             char b[120]; snprintf(b, sizeof b, fmt, args...); ImGui::PushTextWrapPos(0); ImGui::TextUnformatted(b); ImGui::PopTextWrapPos();   // wraps in a narrow column
         };
         row(Ic::Speaker, "Audio", "%s  %dk  %.0f kHz %s", au.codec.empty() ? "-" : au.codec.c_str(), au.bitrate, au.sampleRate / 1000.0, au.channels == 1 ? "mono" : "stereo");
+        if (au.aac.valid) {   // what the superframe header says, exactly
+            const DabAacParams& p = au.aac;
+            row(Ic::Layers, "Profile", "%s", p.profile.c_str());
+            row(Ic::Wave, "Rates", "core %.0f kHz%s, output %.0f kHz", p.coreRate / 1000.0, p.sbr ? " + SBR" : "", p.outRate / 1000.0);
+            if (p.sbr && au.sbrDecoded) row(Ic::Check, "Decoder", "%s: SBR%s applied", au.decoder.c_str(), au.psDecoded ? " and PS" : "");
+            else if (p.sbr) row(Ic::Warning, "Decoder", "%s plays the %.0f kHz core only: no SBR%s (install faad2 / libfaad for full HE-AAC)", au.decoder.c_str(), p.coreRate / 1000.0, p.ps ? " or PS" : "");
+            else if (!au.decoder.empty()) row(Ic::Layers, "Decoder", "%s", au.decoder.c_str());
+            row(Ic::Speaker, "Channels", "core %s%s%s", p.coreChannels == 2 ? "stereo" : "mono", p.ps ? " + PS: output stereo" : "", p.surround ? " + MPEG Surround" : "");
+        }
+        for (const auto& kv : ens.services) {
+            const DabComponent* c = kv.second.playable();
+            if (!c || c->subId != cur) continue;
+            const std::string pg = programmeText(ens, kv.second);
+            if (!pg.empty()) row(Ic::Radio, "Programme", "%s", pg.c_str());
+        }
         row(Ic::Clock, "Buffer", "%d ms", au.bufferedMs);
         row(Ic::Layers, "Frames", "%llu superframes ok / %llu bad", (unsigned long long)au.superframesOk, (unsigned long long)au.superframesBad);
         row(Ic::Warning, "Errors", "%llu bytes fixed, %llu audio frames bad", (unsigned long long)au.rsCorrected, (unsigned long long)au.auBad);
@@ -304,12 +568,19 @@ void dabStations(App& a) {
         ImGui::EndTable();
     }
     ImGui::Spacing();
+    dabAnnouncementUi(a, ens);
+    if (!video) dabRecordUi(a, ens);
+    ImGui::Spacing();
     {   // a "now playing" box where the video preview sits in the other modes
         const float vh = std::max(60.f, ImGui::GetContentRegionAvail().y - 30.f);
         ImGui::BeginChild("dabnow", ImVec2(0, vh), ImGuiChildFlags_Borders);
         std::string name = "no station";
         std::string dls;
-        for (const auto& kv : ens.services) { const DabComponent* ac = kv.second.playable(); if (ac && ac->subId == cur) { name = kv.second.label; dls = kv.second.dls; } }
+        std::vector<std::pair<std::string, std::string>> tags;
+        for (const auto& kv : ens.services) { const DabComponent* ac = kv.second.playable(); if (ac && ac->subId == cur) { name = kv.second.label; dls = kv.second.dls; dlPlusLines(kv.second, tags); } }
+        auto drawTags = [&](float bw) {   // the tagged parts of the label (DL Plus), the plain label as well when it says more
+            for (const auto& t : tags) { ImGui::SetCursorPosX(8); ImGui::PushTextWrapPos(bw - 8); ImGui::TextDisabled("%s", t.first.c_str()); ImGui::SameLine(); ImGui::Text("%s", t.second.c_str()); ImGui::PopTextWrapPos(); }
+        };
         if (video && a.video.has()) { a.video.draw(ImGui::GetContentRegionAvail()); ImGui::EndChild(); return; }   // the DMB picture, drawn as the TV modes draw theirs
         dabSlideUpdate(a);
         if (cur >= 0 && gDabSlide.img) {   // the station's picture under its name, as large as the box allows
@@ -317,7 +588,8 @@ void dabStations(App& a) {
             const ImVec2 ns = ImGui::CalcTextSize(name.c_str());
             ImGui::SetCursorPosX(std::max(0.f, (bw - ns.x) * 0.5f));
             ImGui::TextUnformatted(name.c_str());
-            const float dlsH = dls.empty() ? 0.f : ImGui::CalcTextSize(dls.c_str(), nullptr, false, std::max(1.f, bw - 16)).y + ImGui::GetStyle().ItemSpacing.y;
+            const float dlsH = tags.empty() ? (dls.empty() ? 0.f : ImGui::CalcTextSize(dls.c_str(), nullptr, false, std::max(1.f, bw - 16)).y + ImGui::GetStyle().ItemSpacing.y)
+                                            : (float)tags.size() * (ImGui::GetTextLineHeight() + ImGui::GetStyle().ItemSpacing.y);
             const ImVec2 av = ImGui::GetContentRegionAvail();
             const float sc = std::min(std::min(av.x / (float)gDabSlide.w, (av.y - dlsH) / (float)gDabSlide.h), 4.f);
             if (sc > 0.f) {
@@ -325,7 +597,8 @@ void dabStations(App& a) {
                 ImGui::SetCursorPosX(std::max(0.f, (bw - sz.x) * 0.5f));
                 ImGui::Image(gDabSlide.img->texture(), sz);
             }
-            if (!dls.empty()) { ImGui::SetCursorPosX(8); ImGui::PushTextWrapPos(bw - 8); ImGui::TextDisabled("%s", dls.c_str()); ImGui::PopTextWrapPos(); }
+            drawTags(bw);
+            if (!dls.empty() && tags.empty()) { ImGui::SetCursorPosX(8); ImGui::PushTextWrapPos(bw - 8); ImGui::TextDisabled("%s", dls.c_str()); ImGui::PopTextWrapPos(); }
             ImGui::EndChild();
             return;
         }
@@ -336,7 +609,8 @@ void dabStations(App& a) {
         const ImVec2 ts = ImGui::CalcTextSize(name.c_str());
         ImGui::SetCursorPosX(std::max(0.f, (cw - ts.x) * 0.5f));
         ImGui::TextUnformatted(name.c_str());
-        if (!dls.empty()) { ImGui::SetCursorPosX(8); ImGui::PushTextWrapPos(cw - 8); ImGui::TextDisabled("%s", dls.c_str()); ImGui::PopTextWrapPos(); }
+        drawTags(cw);
+        if (!dls.empty() && tags.empty()) { ImGui::SetCursorPosX(8); ImGui::PushTextWrapPos(cw - 8); ImGui::TextDisabled("%s", dls.c_str()); ImGui::PopTextWrapPos(); }
         ImGui::EndChild();
     }
 }
@@ -384,7 +658,7 @@ void dabRadioTab(App& a) {
             ImGui::TableNextColumn(); ImGui::TextDisabled("%s", ac ? (ac->dmb() ? "DMB (video)" : sv.dabPlus() ? "DAB+ (HE-AAC)" : "DAB (MP2)") : "data");
             ImGui::TableNextColumn(); ImGui::TextDisabled("%s", ac ? dabSubText(ens, ac->subId).c_str() : "");
             ImGui::TableNextColumn(); ImGui::PushFont(a.mono, 0); ImGui::TextDisabled("%04X", sv.sid); ImGui::PopFont();
-            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sv.dls.c_str());
+            ImGui::TableNextColumn(); { const std::string dp = dlPlusShort(sv); ImGui::TextDisabled("%s", dp.empty() ? sv.dls.c_str() : dp.c_str()); }
             ImGui::PopTextWrapPos();
         }
         ImGui::EndTable();
@@ -438,7 +712,7 @@ void dabScanTab(App& a) {
         ImGui::BeginDisabled(!run);
         if (iconButton(Ic::Scan, "Scan Band III", pal::remap(IM_COL32(32, 96, 140, 255)), pal::remap(IM_COL32(44, 124, 178, 255)))) {
             s.running = true; s.idx = -1; s.t0 = 0; s.results.clear(); s.savedFreq = a.freqMhz;
-            a.engine.dabSelect(-1);
+            dabSelectStation(a, -1, false);
         }
         ImGui::EndDisabled();
         if (!run) { ImGui::SameLine(); ImGui::TextDisabled("start the receiver first"); }

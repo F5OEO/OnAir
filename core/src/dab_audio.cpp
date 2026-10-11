@@ -4,20 +4,93 @@
 #include "dect2/dab_pad.h"
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/opt.h>
 #include <libswresample/swresample.h>
 }
 #include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <mutex>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 namespace dect2 {
+
+// ---- faad2, loaded at run time when it is installed (it is not shipped): FFmpeg's AAC decoder has no SBR and no parametric stereo for the 960
+// sample frames of DAB+, faad2 has. The few calls and structures used are declared here, as faad2's headers lay them out (neaacdec.h).
+namespace {
+struct FaadConfig { unsigned char defObjectType; unsigned long defSampleRate; unsigned char outputFormat, downMatrix, useOldADTSFormat, dontUpSampleImplicitSBR; };
+struct FaadFrameInfo {
+    unsigned long bytesconsumed, samples;
+    unsigned char channels, error;
+    unsigned long samplerate;
+    unsigned char sbr, object_type, header_type, num_front_channels, num_side_channels, num_back_channels, num_lfe_channels, channel_position[64], ps;
+    unsigned char spare[256];     // room for what a newer faad2 adds at the end
+};
+struct Faad {
+    typedef void* (*Open)();
+    typedef FaadConfig* (*GetConf)(void*);
+    typedef unsigned char (*SetConf)(void*, FaadConfig*);
+    typedef char (*Init2)(void*, unsigned char*, unsigned long, unsigned long*, unsigned char*);
+    typedef void* (*Decode)(void*, FaadFrameInfo*, unsigned char*, unsigned long);
+    typedef void (*Close)(void*);
+    Open open = nullptr; GetConf getConf = nullptr; SetConf setConf = nullptr; Init2 init2 = nullptr; Decode decode = nullptr; Close close = nullptr;
+    bool ok = false;
+    Faad() {
+#ifdef _WIN32
+        for (const char* n : {"libfaad2.dll", "faad2.dll", "libfaad.dll"}) { if ((h = (void*)LoadLibraryA(n))) break; }
+        auto sym = [&](const char* s) { return h ? (void*)GetProcAddress((HMODULE)h, s) : nullptr; };
+#else
+        for (const char* n : {"libfaad.so.2", "libfaad.so", "libfaad.2.dylib", "libfaad.dylib", "/opt/homebrew/lib/libfaad.dylib", "/usr/local/lib/libfaad.dylib"}) { if ((h = dlopen(n, RTLD_NOW | RTLD_LOCAL))) break; }
+        auto sym = [&](const char* s) { return h ? dlsym(h, s) : nullptr; };
+#endif
+        open = (Open)sym("NeAACDecOpen"); getConf = (GetConf)sym("NeAACDecGetCurrentConfiguration"); setConf = (SetConf)sym("NeAACDecSetConfiguration");
+        init2 = (Init2)sym("NeAACDecInit2"); decode = (Decode)sym("NeAACDecDecode"); close = (Close)sym("NeAACDecClose");
+        ok = open && getConf && setConf && init2 && decode && close;
+    }
+    void* h = nullptr;
+    static Faad& get() { static Faad f; return f; }
+};
+std::atomic<int> gAacBackend{0};   // 0 faad2 for the streams with SBR when it is there, 1 FFmpeg always, 2 faad2 always (when there)
+} // namespace
+
+bool dabFaadAvailable() { return Faad::get().ok; }
+
+DabAacParams dabAacParams(uint8_t h) {
+    DabAacParams p;
+    const int dac = (h >> 6) & 1;
+    p.valid = true;
+    p.sbr = (h >> 5) & 1; p.stereo = (h >> 4) & 1; p.ps = (h >> 3) & 1; p.surround = h & 7;
+    if (p.ps && !p.sbr) p.valid = false;   // parametric stereo needs SBR
+    p.outRate = dac ? 48000 : 32000;
+    p.coreRate = p.sbr ? p.outRate / 2 : p.outRate;
+    p.auPerSuperframe = dac ? (p.sbr ? 3 : 6) : (p.sbr ? 2 : 4);
+    p.coreChannels = (p.stereo && !p.ps) ? 2 : 1;
+    p.outChannels = (p.stereo || p.ps) ? 2 : 1;
+    p.profile = p.sbr && p.ps ? "HE-AAC v2 (AAC-LC + SBR + PS)" : p.sbr ? "HE-AAC (AAC-LC + SBR)" : "AAC-LC";
+    return p;
+}
 
 struct DabAudio::Impl {
     mutable std::mutex mu;
     AudioOut out;
+    // the last decoded samples (stereo), for the spectrum of the interface
+    static constexpr int kRing = 16384;
+    mutable std::mutex pmu;
+    std::vector<float> ring = std::vector<float>((size_t)kRing * 2, 0.f);
+    uint64_t ringTotal = 0;
     bool silent = false, outStarted = false;
     DabAudioStats st;
     DabPadDecoder pad;
@@ -39,6 +112,9 @@ struct DabAudio::Impl {
     AVFrame* frame = nullptr;
     SwrContext* swr = nullptr;
     int swrRate = 0, swrFmt = -1, swrCh = 0;
+    void* faad = nullptr;                 // a faad2 decoder, when that one decodes
+    SwrContext* swrF = nullptr;           // its float output to 48 kHz stereo
+    int swrFRate = 0, swrFCh = 0;
     uint8_t openHeader = 0xFF;
     std::vector<float> pcm;
 
@@ -47,7 +123,9 @@ struct DabAudio::Impl {
     void closeDecoder() {
         if (ctx) avcodec_free_context(&ctx);
         if (swr) swr_free(&swr);
-        swrRate = 0; swrFmt = -1; swrCh = 0;
+        if (swrF) swr_free(&swrF);
+        if (faad) { Faad::get().close(faad); faad = nullptr; }
+        swrRate = 0; swrFmt = -1; swrCh = 0; swrFRate = 0; swrFCh = 0;
         openHeader = 0xFF;
     }
 
@@ -73,6 +151,30 @@ struct DabAudio::Impl {
     bool openAac(uint8_t hdr) {
         closeDecoder();
         const int dac = (hdr >> 6) & 1, sbr = (hdr >> 5) & 1, stereo = (hdr >> 4) & 1, ps = (hdr >> 3) & 1;
+        const int backend = gAacBackend.load();
+        if (backend != 1 && (sbr || backend == 2) && Faad::get().ok) {   // faad2: SBR and PS work with DAB+'s frames
+            Faad& F = Faad::get();
+            faad = F.open();
+            if (faad) {
+                FaadConfig* c = F.getConf(faad);
+                c->outputFormat = 4;   // FAAD_FMT_FLOAT
+                c->downMatrix = 0;
+                c->dontUpSampleImplicitSBR = 0;
+                F.setConf(faad, c);
+                std::vector<uint8_t> asc = makeAsc(dac, sbr, stereo, ps);
+                unsigned long rate = 0;
+                unsigned char ch = 0;
+                if (F.init2(faad, asc.data(), (unsigned long)asc.size(), &rate, &ch) >= 0) {
+                    openHeader = hdr;
+                    st.codec = sbr && ps ? "HE-AAC v2" : sbr ? "HE-AAC" : "AAC-LC";
+                    st.decoder = "faad2";
+                    st.channels = (stereo || ps) ? 2 : 1;
+                    return true;
+                }
+                F.close(faad); faad = nullptr;
+            }
+        }
+        st.decoder = "FFmpeg";
         codec = avcodec_find_decoder(AV_CODEC_ID_AAC);
         if (!codec) return false;
         ctx = avcodec_alloc_context3(codec);
@@ -97,9 +199,141 @@ struct DabAudio::Impl {
         return true;
     }
 
+    // ---- recording (all of it under mu)
+    struct Rec {
+        bool active = false;
+        DabRecFormat fmt = DabRecFormat::Wav;
+        std::string path, error;
+        FILE* f = nullptr;              // WAV, MP2
+        FILE* log = nullptr;            // the dynamic label log
+        AVFormatContext* oc = nullptr;  // DAB+ (MP4)
+        int64_t pts = 0, auTicks = 960;
+        bool muxOpen = false;
+        uint64_t bytes = 0, pcmFrames = 0, units = 0;
+        double unitSec = 0.024;         // seconds of one unit written (MP2 frame, AU)
+        std::string lastDl;
+    } rec;
+
+    static void le32(uint8_t* p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
+    void wavHeader(uint32_t dataBytes) {
+        uint8_t h[44];
+        std::memcpy(h, "RIFF", 4); le32(h + 4, 36 + dataBytes); std::memcpy(h + 8, "WAVEfmt ", 8); le32(h + 16, 16);
+        h[20] = 1; h[21] = 0; h[22] = 2; h[23] = 0; le32(h + 24, 48000); le32(h + 28, 48000 * 4); h[32] = 4; h[33] = 0; h[34] = 16; h[35] = 0;
+        std::memcpy(h + 36, "data", 4); le32(h + 40, dataBytes);
+        std::fseek(rec.f, 0, SEEK_SET);
+        std::fwrite(h, 1, 44, rec.f);
+    }
+    void recStop() {
+        if (!rec.active) return;
+        if (rec.fmt == DabRecFormat::Wav && rec.f) { wavHeader((uint32_t)std::min<uint64_t>(rec.pcmFrames * 4, 0xFFFFFFFFu - 64)); }
+        if (rec.oc) {
+            if (rec.muxOpen) av_write_trailer(rec.oc);
+            if (rec.oc->pb) avio_closep(&rec.oc->pb);
+            avformat_free_context(rec.oc);
+            rec.oc = nullptr;
+        }
+        if (rec.f) { std::fclose(rec.f); rec.f = nullptr; }
+        if (rec.log) { std::fclose(rec.log); rec.log = nullptr; }
+        rec.active = false;
+        rec.muxOpen = false;
+    }
+    void recFail(const char* why) { rec.error = why; recStop(); }
+    void recWav(const float* stereo, int frames) {
+        std::vector<int16_t> b((size_t)frames * 2);
+        for (size_t i = 0; i < b.size(); i++) b[i] = (int16_t)std::lrintf(std::max(-1.f, std::min(1.f, stereo[i])) * 32767.f);
+        if (std::fwrite(b.data(), 2, b.size(), rec.f) != b.size()) { recFail("write error"); return; }
+        rec.pcmFrames += (uint64_t)frames;
+        rec.bytes = rec.pcmFrames * 4 + 44;
+    }
+    // length of the MPEG audio layer II frame that starts at p (0 = not a frame)
+    static int mp2FrameLen(const uint8_t* p, int n, double* secs = nullptr) {
+        if (n < 4 || p[0] != 0xFF || (p[1] & 0xE0) != 0xE0) return 0;
+        const int ver = (p[1] >> 3) & 3, layer = (p[1] >> 1) & 3, bi = p[2] >> 4, si = (p[2] >> 2) & 3, pad = (p[2] >> 1) & 1;
+        if (layer != 2 || ver == 1 || bi == 0 || bi == 15 || si == 3) return 0;
+        static const int br1[15] = {0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384};
+        static const int br2[15] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160};
+        static const int sr1[3] = {44100, 48000, 32000};
+        const bool lsf = ver != 3;
+        const int sr = sr1[si] / (ver == 3 ? 1 : ver == 2 ? 2 : 4);
+        const int len = 144 * (lsf ? br2[bi] : br1[bi]) * 1000 / sr + pad;
+        if (secs) *secs = 1152.0 / sr;
+        return len <= n ? len : 0;
+    }
+    void recMp2(const uint8_t* frame, int n) {
+        const int len = mp2FrameLen(frame, n, &rec.unitSec);
+        if (len <= 0) return;
+        if (std::fwrite(frame, 1, (size_t)len, rec.f) != (size_t)len) { recFail("write error"); return; }
+        rec.bytes += (uint64_t)len;
+        rec.units++;
+    }
+    bool recOpenAac(uint8_t hdr) {
+        const int dac = (hdr >> 6) & 1, sbr = (hdr >> 5) & 1, stereo = (hdr >> 4) & 1, ps = (hdr >> 3) & 1;
+        const int coreRate = sbr ? (dac ? 24000 : 16000) : (dac ? 48000 : 32000), outRate = sbr ? coreRate * 2 : coreRate;
+        const std::vector<uint8_t> asc = makeAsc(dac, sbr, stereo, ps);
+        if (avformat_alloc_output_context2(&rec.oc, nullptr, "mp4", rec.path.c_str()) < 0 || !rec.oc) { recFail("no MP4 muxer"); return false; }
+        AVStream* s = avformat_new_stream(rec.oc, nullptr);
+        if (!s) { recFail("no stream"); return false; }
+        AVCodecParameters* cp = s->codecpar;
+        cp->codec_type = AVMEDIA_TYPE_AUDIO; cp->codec_id = AV_CODEC_ID_AAC; cp->sample_rate = outRate; cp->frame_size = 960 * (sbr ? 2 : 1);
+        av_channel_layout_default(&cp->ch_layout, (stereo && !ps) ? 2 : 1);
+        cp->extradata = (uint8_t*)av_mallocz(asc.size() + AV_INPUT_BUFFER_PADDING_SIZE);
+        std::memcpy(cp->extradata, asc.data(), asc.size());
+        cp->extradata_size = (int)asc.size();
+        s->time_base = AVRational{1, outRate};
+        rec.auTicks = 960 * (sbr ? 2 : 1);
+        rec.unitSec = 960.0 / coreRate;
+        if (avio_open(&rec.oc->pb, rec.path.c_str(), AVIO_FLAG_WRITE) < 0) { recFail("cannot create the file"); return false; }
+        AVDictionary* o = nullptr;
+        av_dict_set(&o, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);   // playable even if the program stops before the end
+        const int r = avformat_write_header(rec.oc, &o);
+        av_dict_free(&o);
+        if (r < 0) { recFail("cannot write the header"); return false; }
+        rec.muxOpen = true;
+        return true;
+    }
+    void recAu(const uint8_t* au, int n, uint8_t hdr) {
+        if (!rec.muxOpen && !recOpenAac(hdr & 0x7F)) return;
+        AVPacket* pk = av_packet_alloc();
+        if (!pk || av_new_packet(pk, n) < 0) { if (pk) av_packet_free(&pk); return; }
+        std::memcpy(pk->data, au, (size_t)n);
+        pk->stream_index = 0; pk->pts = pk->dts = rec.pts; pk->duration = rec.auTicks; pk->flags |= AV_PKT_FLAG_KEY;
+        rec.pts += rec.auTicks;
+        const int r = av_interleaved_write_frame(rec.oc, pk);
+        av_packet_free(&pk);
+        if (r < 0) { recFail("write error"); return; }
+        rec.bytes += (uint64_t)n;
+        rec.units++;
+    }
+    void recLabel() {
+        if (!rec.log) return;
+        std::string t = pad.label();
+        for (const DabDlpTag& g : pad.dlPlus()) t += std::string("  [") + dabDlpTypeName(g.type) + ": " + g.text + "]";
+        if (t == rec.lastDl) return;
+        rec.lastDl = t;
+        const time_t now = std::time(nullptr);
+        struct tm m;
+#ifdef _WIN32
+        localtime_s(&m, &now);
+#else
+        localtime_r(&now, &m);
+#endif
+        char ts[24];
+        std::strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &m);
+        std::fprintf(rec.log, "%s\t%s\n", ts, t.c_str());
+        std::fflush(rec.log);
+    }
+
     void emit(const float* stereo, int frames) {
         st.pcmFrames += (uint64_t)frames;
         st.decoding = true;
+        {
+            std::lock_guard<std::mutex> lk(pmu);
+            for (int i = 0; i < frames; i++) {
+                const size_t w = (size_t)(ringTotal++ % kRing) * 2;
+                ring[w] = stereo[2 * i]; ring[w + 1] = stereo[2 * i + 1];
+            }
+        }
+        if (rec.active && rec.fmt == DabRecFormat::Wav) recWav(stereo, frames);
         if (silent) return;
         if (!outStarted) {
             out.setStartThreshold(12000);
@@ -109,7 +343,38 @@ struct DabAudio::Impl {
         if (outStarted) out.write(stereo, frames);
     }
 
+    // float samples of any rate and one or two channels to the 48 kHz stereo of the output
+    void emitFloat(const float* in, int frames, int ch, int rate) {
+        if (rate == 48000 && ch == 2) { emit(in, frames); return; }
+        if (!swrF || swrFRate != rate || swrFCh != ch) {
+            if (swrF) swr_free(&swrF);
+            AVChannelLayout inL, outL = AV_CHANNEL_LAYOUT_STEREO;
+            av_channel_layout_default(&inL, ch);
+            swr_alloc_set_opts2(&swrF, &outL, AV_SAMPLE_FMT_FLT, 48000, &inL, AV_SAMPLE_FMT_FLT, rate, 0, nullptr);
+            if (!swrF || swr_init(swrF) < 0) { if (swrF) swr_free(&swrF); return; }
+            swrFRate = rate; swrFCh = ch;
+            st.sampleRate = rate; st.channels = ch;
+        }
+        const int maxOut = (int)((int64_t)frames * 48000 / std::max(1, rate)) + 64;
+        pcm.resize((size_t)maxOut * 2);
+        uint8_t* o[1] = {(uint8_t*)pcm.data()};
+        const uint8_t* ip[1] = {(const uint8_t*)in};
+        const int got = swr_convert(swrF, o, maxOut, ip, frames);
+        if (got > 0) emit(pcm.data(), got);
+    }
+
     void decodePacket(const uint8_t* data, int n) {
+        if (faad) {
+            FaadFrameInfo fi;
+            std::memset(&fi, 0, sizeof fi);
+            std::vector<uint8_t> in(data, data + n);
+            const void* out = Faad::get().decode(faad, &fi, in.data(), (unsigned long)n);
+            if (fi.error == 0 && out && fi.samples > 0 && fi.channels >= 1 && fi.channels <= 2) {
+                st.sbrDecoded = fi.sbr != 0; st.psDecoded = fi.ps != 0;
+                emitFloat((const float*)out, (int)(fi.samples / fi.channels), fi.channels, (int)fi.samplerate);
+            }
+            return;
+        }
         if (!ctx) return;
         if (!pkt) pkt = av_packet_alloc();
         if (!frame) frame = av_frame_alloc();
@@ -169,6 +434,7 @@ struct DabAudio::Impl {
         for (int k = 0; k < nAu; k++) if (starts[(size_t)k + 1] <= starts[(size_t)k] || starts[(size_t)k + 1] > (int)payload.size()) return false;
         std::lock_guard<std::mutex> lk(mu);
         st.rsCorrected += (uint64_t)corrected;
+        st.aac = dabAacParams(hdr);
         if (openHeader != (hdr & 0x7F)) { if (!openAac(hdr & 0x7F)) return true; openHeader = hdr & 0x7F; }
         for (int k = 0; k < nAu; k++) {
             const uint8_t* au = &payload[(size_t)starts[(size_t)k]];
@@ -177,6 +443,7 @@ struct DabAudio::Impl {
                 st.auOk++;
                 if (auTap) auTap(au, len - 2, hdr);
                 pad.accessUnit(au, len - 2);
+                if (rec.active) { if (rec.fmt == DabRecFormat::Encoded) recAu(au, len - 2, hdr); recLabel(); }
                 decodePacket(au, len - 2);
             } else st.auBad++;
         }
@@ -185,16 +452,18 @@ struct DabAudio::Impl {
 };
 
 DabAudio::DabAudio() : p_(new Impl) {}
-DabAudio::~DabAudio() = default;
+DabAudio::~DabAudio() { if (p_) { std::lock_guard<std::mutex> lk(p_->mu); p_->recStop(); } }
 
 void DabAudio::select(int sub, bool dabPlus, int bitrate) {
     std::lock_guard<std::mutex> lk(p_->mu);
     Impl& I = *p_;
+    I.recStop();
     I.closeDecoder();
     I.frames.clear();
     I.synced = false; I.since = 0; I.consecBad = 0;
     I.dabPlus = dabPlus; I.bitrate = bitrate;
     I.st = DabAudioStats();
+    { std::lock_guard<std::mutex> pl(I.pmu); I.ringTotal = 0; }
     I.slideEpoch += I.pad.seq() + 1;
     I.pad.reset();
     I.st.sub = sub; I.st.dabPlus = dabPlus; I.st.bitrate = bitrate;
@@ -213,6 +482,8 @@ void DabAudio::push(const uint8_t* frame, int n) {
     if (!I.dabPlus) {
         std::lock_guard<std::mutex> lk(I.mu);
         I.st.frames++;
+        if (I.rec.active && I.rec.fmt == DabRecFormat::Encoded) I.recMp2(frame, n);
+        if (const int fl = Impl::mp2FrameLen(frame, n)) { I.pad.mp2Frame(frame, fl); if (I.rec.active) I.recLabel(); }   // the PAD at the end of the audio frame
         I.decodePacket(frame, n);
         return;
     }
@@ -239,6 +510,20 @@ DabAudioStats DabAudio::stats() const {
     return s;
 }
 
+int DabAudio::recent(std::vector<float>& stereo, int frames) const {
+    std::lock_guard<std::mutex> lk(p_->pmu);
+    const Impl& I = *p_;
+    const int n = (int)std::min<uint64_t>((uint64_t)std::min(frames, Impl::kRing), I.ringTotal);
+    stereo.resize((size_t)n * 2);
+    for (int i = 0; i < n; i++) {
+        const size_t r = (size_t)((I.ringTotal - (uint64_t)n + (uint64_t)i) % Impl::kRing) * 2;
+        stereo[(size_t)i * 2] = I.ring[r]; stereo[(size_t)i * 2 + 1] = I.ring[r + 1];
+    }
+    return n;
+}
+
+void DabAudio::setAacBackend(int mode) { gAacBackend = mode; }
+
 void DabAudio::setVolume(float v) { p_->volume = v; if (p_->outStarted) p_->out.setVolume(v); }
 void DabAudio::setMuted(bool m) { p_->muted = m; if (p_->outStarted) p_->out.setMuted(m); }
 void DabAudio::setAuTap(std::function<void(const uint8_t*, int, uint8_t)> cb) { p_->auTap = std::move(cb); }
@@ -250,6 +535,46 @@ bool DabAudio::slide(DabSlide& out, uint64_t lastSeq) const {
     out.seq = seq;
     return true;
 }
+std::vector<DabDlpTag> DabAudio::dlPlus(bool* running) const {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    if (running) *running = p_->pad.dlPlusRunning();
+    return p_->pad.dlPlus();
+}
+
+bool DabAudio::startRecording(const std::string& base, DabRecFormat fmt, bool dlLog, std::string* err) {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    Impl& I = *p_;
+    auto fail = [&](const char* why) { if (err) *err = why; return false; };
+    I.recStop();
+    if (I.st.sub < 0) return fail("no service is playing");
+    I.rec = Impl::Rec();
+    I.rec.fmt = fmt;
+    const char* ext = fmt == DabRecFormat::Wav ? ".wav" : I.dabPlus ? ".m4a" : ".mp2";
+    I.rec.path = base + ext;
+    if (fmt == DabRecFormat::Wav || !I.dabPlus) {
+        I.rec.f = std::fopen(I.rec.path.c_str(), "wb");
+        if (!I.rec.f) return fail("cannot create the file");
+        if (fmt == DabRecFormat::Wav) I.wavHeader(0);
+    }
+    if (dlLog) I.rec.log = std::fopen((base + ".txt").c_str(), "wb");
+    I.rec.active = true;
+    return true;
+}
+
+void DabAudio::stopRecording() {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    p_->recStop();
+}
+
+DabRecStats DabAudio::recording() const {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    const Impl::Rec& r = p_->rec;
+    DabRecStats s;
+    s.active = r.active; s.path = r.path; s.error = r.error; s.bytes = r.bytes;
+    s.seconds = r.fmt == DabRecFormat::Wav ? (double)r.pcmFrames / 48000.0 : (double)r.units * r.unitSec;
+    return s;
+}
+
 std::string DabAudio::dynamicLabel() const {
     std::lock_guard<std::mutex> lk(p_->mu);
     return p_->pad.label();

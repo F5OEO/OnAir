@@ -1,6 +1,7 @@
 // DAB / DAB+ receiver (ETSI EN 300 401, TS 102 563), transmission mode I (Band III, 1.536 MHz, 1536 carriers).
 #pragma once
 #include "dab_dmb.h"
+#include "dab_fig.h"
 #include "dab_pad.h"
 #include "dab_tel.h"
 #include "ring.h"
@@ -50,6 +51,22 @@ void rsEncode120(const uint8_t* data110, uint8_t* cw120);
 
 class DabAudio;
 
+DabAacParams dabAacParams(uint8_t superframeHeader);   // what the header byte says
+bool dabFaadAvailable();                                // faad2 is installed (loaded at run time): HE-AAC with SBR and PS needs it
+
+// Recording of the audio of the selected service
+enum class DabRecFormat {
+    Wav,        // decoded: 48 kHz stereo, 16 bit
+    Encoded     // as broadcast: DAB+ access units in an MP4 (.m4a) file, DAB MPEG-1 layer II frames in a .mp2 file
+};
+struct DabRecStats {
+    bool active = false;
+    std::string path;           // the file being written
+    std::string error;          // why a recording stopped by itself
+    uint64_t bytes = 0;
+    double seconds = 0;
+};
+
 class DabReceiver {
 public:
     DabReceiver();
@@ -59,6 +76,7 @@ public:
     void feed(const cf32* x, size_t n);
     bool telemetry(DabTelemetry& out, uint64_t lastSeq);
     DabEnsemble ensemble() const;
+    DabFicAnalysis ficAnalysis() const;       // every FIG heard in the fast information channel, raw and counted (decode with dabFigDecode)
     // Decode and play this sub-channel (-1 = none). A DMB video sub-channel goes to the DMB decoder, whose transport stream comes out of
     // the packet callback (24 ms of stream per call); the others go to DabAudio.
     void select(int subId);
@@ -86,7 +104,19 @@ public:
     DabAudioStats stats() const;
     // The slide show picture last received in the PAD of the selected DAB+ service (empty after select()). false when its seq is lastSeq.
     bool slide(DabSlide& out, uint64_t lastSeq) const;
+    // DL Plus tags of the label of the selected DAB+ service (empty when it sends none); `running`: the item is running
+    std::vector<DabDlpTag> dlPlus(bool* running = nullptr) const;
+    // Starts writing the audio of the selected service to base + the extension of the format (".wav", ".m4a", ".mp2"); with `dlLog` the dynamic
+    // labels are also written to base + ".txt", one line with the time of day for each. A selection of another service ends the recording.
+    bool startRecording(const std::string& base, DabRecFormat fmt, bool dlLog, std::string* err = nullptr);
+    void stopRecording();
+    DabRecStats recording() const;
     std::string dynamicLabel() const;                    // the "now playing" text of the selected DAB+ service, UTF-8, empty if none
+    // The last `frames` decoded stereo samples (interleaved, 48 kHz, at most 16384), oldest first: what the spectrum shows. Returns the frames given.
+    int recent(std::vector<float>& stereo, int frames) const;
+    // Which AAC decoder DAB+ uses: 0 faad2 for the streams with SBR when it is installed (FFmpeg cannot apply SBR to 960-sample frames), 1 FFmpeg, 2 faad2
+    // for every stream when it is installed. Applies to the next service selected.
+    static void setAacBackend(int mode);
     void setVolume(float v);
     void setMuted(bool m);
     // Tests: receives every access unit with a good CRC (raw AAC frame) and its superframe header

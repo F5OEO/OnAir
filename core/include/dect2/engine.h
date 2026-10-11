@@ -162,6 +162,7 @@ public:
     double offsetHz() const { return offHz_; }   // the offset in use, 0 = none
     // DAB / DAB+: the ensemble found on the channel, and the station to play (a sub-channel id, -1 = none)
     DabEnsemble dabEnsemble() const { return rxD_.ensemble(); }
+    DabFicAnalysis dabFic() const { return rxD_.ficAnalysis(); }
     void dabSelect(int subId) { rxD_.select(subId); }
     int dabSelected() const { return rxD_.selected(); }
     DabAudio& dabAudio() { return rxD_.audio(); }
