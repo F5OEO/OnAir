@@ -844,7 +844,8 @@ void standardSwitch(App& a) {
     const ModeDef* cur = &kModes[0];
     for (const auto& m : kModes) if (modeSelected(a, m)) cur = &m;
 
-    float segW[32], segX[32], capX[kNumGroups] = {}, grpL[kNumGroups] = {}, grpR[kNumGroups] = {}, capW[kNumGroups];
+    std::vector<float> segW((size_t)kNumModes), segX((size_t)kNumModes);   // one per mode, however many there are
+    float capX[kNumGroups] = {}, grpL[kNumGroups] = {}, grpR[kNumGroups] = {}, capW[kNumGroups];
     for (int g = 0; g < kNumGroups; g++) capW[g] = ImGui::CalcTextSize(kGroupNames[g]).x;
     float x = p.x;
     for (int g = 0; g < kNumGroups; g++) {
