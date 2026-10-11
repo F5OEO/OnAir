@@ -37,6 +37,7 @@ static void testDirect() {
     CHECK(pd.seq() == 1, "one picture expected, seq %llu", (unsigned long long)pd.seq());
     CHECK(sameImage(pd.slide()), "pixels differ");
     CHECK(pd.slide().name == "OnAir test slide", "name '%s'", pd.slide().name.c_str());
+    CHECK(pd.label() == "OnAir Melody - test tune", "label '%s'", pd.label().c_str());
     const uint64_t s1 = pd.seq();
     for (const auto& au : aus) pd.accessUnit(au.data(), (int)au.size());   // the carousel: the same object again is not a new picture
     CHECK(pd.seq() == s1, "repeat counted as new");
@@ -126,6 +127,48 @@ static void testForms() {
     }
 }
 
+// a label by hand: three segments, UTF-8, a toggle change, bad CRC, X-PAD without indicators in between
+static void label(DabPadDecoder& pd, int toggle, int segNo, bool last, const char* text, int charset = 15, bool goodCrc = true) {
+    const size_t n = std::strlen(text);
+    std::vector<uint8_t> s = {(uint8_t)((toggle << 7) | (segNo == 0 ? 0x40 : 0) | (last ? 0x20 : 0) | (n - 1)), (uint8_t)(segNo == 0 ? charset << 4 : segNo << 4)};
+    s.insert(s.end(), text, text + n);
+    const uint16_t c = dabgen::crc16(s.data(), (int)s.size());
+    s.push_back((uint8_t)(c >> 8)); s.push_back((uint8_t)c ^ (goodCrc ? 0 : 1));
+    // sent as a type 2 start with 8 bytes, the rest as continuation without indicators
+    std::vector<uint8_t> xp = {(uint8_t)((2 << 5) | 2), 0x00};
+    xp.insert(xp.end(), s.begin(), s.begin() + 8);
+    uint8_t fp[2] = {0x20, 0x02};
+    pd.pad(xp.data(), (int)xp.size(), fp);
+    for (size_t p = 8; p < s.size(); p += 8) {
+        std::vector<uint8_t> x(8, 0);
+        for (size_t i = 0; i < 8 && p + i < s.size(); i++) x[i] = s[p + i];
+        fp[1] = 0x00;
+        pd.pad(x.data(), 8, fp);
+    }
+}
+static void testLabel() {
+    DabPadDecoder pd;
+    label(pd, 0, 0, false, "Beyonc\xC3\xA9 - ");
+    CHECK(pd.label().empty(), "label before the last segment");
+    label(pd, 0, 1, true, "Halo");
+    CHECK(pd.label() == "Beyonc\xC3\xA9 - Halo", "label '%s'", pd.label().c_str());
+    label(pd, 1, 0, true, "Next song", 15, false);       // bad CRC: ignored
+    CHECK(pd.label() == "Beyonc\xC3\xA9 - Halo", "bad CRC accepted: '%s'", pd.label().c_str());
+    label(pd, 1, 0, true, "Next song");
+    CHECK(pd.label() == "Next song", "toggle change: '%s'", pd.label().c_str());
+    const uint8_t clr[4] = {0x10 | 0x40 | 0x20 | 1, 0x00, 0, 0};   // command 1: clear display
+    std::vector<uint8_t> s(clr, clr + 2);
+    const uint16_t c = dabgen::crc16(s.data(), 2);
+    s.push_back((uint8_t)(c >> 8)); s.push_back((uint8_t)c);
+    const uint8_t xp[6] = {(uint8_t)((0 << 5) | 2), 0x00, 0, 0, 0, 0};
+    std::vector<uint8_t> x = {(uint8_t)((0 << 5) | 2), 0x00};
+    x.insert(x.end(), s.begin(), s.end());
+    const uint8_t fp[2] = {0x20, 0x02};
+    (void)xp;
+    pd.pad(x.data(), (int)x.size(), fp);
+    CHECK(pd.label().empty(), "clear display: '%s'", pd.label().c_str());
+}
+
 static void testAudio() {
     dabgen::Transmitter tx(config());
     DabAudio au;
@@ -142,15 +185,18 @@ static void testAudio() {
     CHECK(got && s.seq > 0 && sameImage(s), "DabAudio: slide %d", (int)got);
     const uint64_t seq1 = s.seq;
     CHECK(!au.slide(s, seq1), "no new picture expected");
+    CHECK(au.dynamicLabel() == "OnAir Melody - test tune", "DabAudio label '%s'", au.dynamicLabel().c_str());
     const DabAudioStats st = au.stats();
     CHECK(st.auBad == 0 && st.superframesBad == 0 && st.pcmFrames > 0, "audio with PAD: %llu bad, %llu pcm frames", (unsigned long long)st.auBad, (unsigned long long)st.pcmFrames);
     au.select(3, true, 64);
+    CHECK(au.dynamicLabel().empty(), "label kept after select()");
     CHECK(au.slide(s, seq1) && s.seq > seq1 && s.w == 0 && s.rgba.empty(), "slide kept after select()");
 }
 
 int main() {
     testDirect();
     testForms();
+    testLabel();
     testAudio();
     if (fails) { printf("%d FAILED\n", fails); return 1; }
     printf("test_dab_pad: all passed\n");

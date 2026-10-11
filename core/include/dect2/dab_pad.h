@@ -28,6 +28,7 @@ public:
     // The PAD of one audio frame: xpad = the X-PAD bytes in the order they were sent, fpad = the last two bytes of the PAD.
     void pad(const uint8_t* xpad, int xlen, const uint8_t fpad[2]);
     uint64_t seq() const { return slide_.seq; }
+    const std::string& label() const { return label_; }   // the dynamic label (X-PAD application types 2 and 3), UTF-8
     const DabSlide& slide() const { return slide_; }
 
 private:
@@ -40,11 +41,18 @@ private:
     void dataGroup(const uint8_t* d, int n);
     void segment(uint16_t tid, int type, int segNo, bool last, const uint8_t* d, int n);
     void tryComplete(Obj& o);
+    void labelSegment(const uint8_t* d, int n);
 
     int lastType_ = 0;                   // application type of the last content indicator, for X-PAD without one
     std::vector<uint8_t> group_;         // the data group being collected
     int groupLen_ = 0;                   // its length from the data group length indicator, 0 = none seen
     bool collecting_ = false;
+    std::vector<uint8_t> dls_;           // the dynamic label segment being collected
+    bool dlsOn_ = false;
+    int dlsToggle_ = -1;                 // toggle bit of the label being assembled
+    std::map<int, std::vector<uint8_t>> dlsParts_;
+    int dlsLast_ = -1, dlsCharset_ = 0;
+    std::string label_;
     std::map<uint16_t, Obj> objs_;
     std::deque<uint16_t> order_;
     DabSlide slide_;

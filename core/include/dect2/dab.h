@@ -86,6 +86,7 @@ public:
     DabAudioStats stats() const;
     // The slide show picture last received in the PAD of the selected DAB+ service (empty after select()). false when its seq is lastSeq.
     bool slide(DabSlide& out, uint64_t lastSeq) const;
+    std::string dynamicLabel() const;                    // the "now playing" text of the selected DAB+ service, UTF-8, empty if none
     void setVolume(float v);
     void setMuted(bool m);
     // Tests: receives every access unit with a good CRC (raw AAC frame) and its superframe header

@@ -250,6 +250,10 @@ bool DabAudio::slide(DabSlide& out, uint64_t lastSeq) const {
     out.seq = seq;
     return true;
 }
+std::string DabAudio::dynamicLabel() const {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    return p_->pad.label();
+}
 void DabAudio::setSilent(bool s) { p_->silent = s; }
 
 } // namespace dect2

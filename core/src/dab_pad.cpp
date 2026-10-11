@@ -2,6 +2,7 @@
 #include "dect2/dab_pad.h"
 #include "dect2/dab.h"
 #include "dect2/png.h"
+#include "dect2/text_charset.h"
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
@@ -51,6 +52,7 @@ bool decodeSlideImage(const uint8_t* data, size_t n, int subtype, int& w, int& h
 
 void DabPadDecoder::reset() {
     lastType_ = 0; group_.clear(); groupLen_ = 0; collecting_ = false;
+    dls_.clear(); dlsOn_ = false; dlsToggle_ = -1; dlsParts_.clear(); dlsLast_ = -1; label_.clear();
     objs_.clear(); order_.clear();
     slide_ = DabSlide();
 }
@@ -109,7 +111,20 @@ void DabPadDecoder::subfield(int type, const uint8_t* d, int n) {
         collecting_ = false;
         return;
     }
-    if (type != 12 && type != 13) return;                   // 2 / 3 (dynamic label) and the rest are not used here
+    if (type == 2 || type == 3) {                           // dynamic label: segments of a 2 byte prefix, up to 16 characters and a CRC-16
+        if (type == 2) { dls_.clear(); dlsOn_ = true; }
+        if (!dlsOn_) return;
+        dls_.insert(dls_.end(), d, d + n);
+        if (dls_.size() >= 2) {
+            const int total = 2 + ((dls_[0] & 0x10) ? 0 : (dls_[0] & 0x0F) + 1) + 2;
+            if ((int)dls_.size() >= total) {
+                dlsOn_ = false;
+                if (dab::crc16(dls_.data(), total - 2) == (uint16_t)((dls_[total - 2] << 8) | dls_[total - 1])) labelSegment(dls_.data(), total - 2);
+            }
+        }
+        return;
+    }
+    if (type != 12 && type != 13) return;
     if (type == 12) { group_.clear(); collecting_ = groupLen_ > 0; }
     if (!collecting_) return;
     const size_t take = std::min((size_t)n, (size_t)groupLen_ - group_.size());
@@ -120,6 +135,25 @@ void DabPadDecoder::subfield(int type, const uint8_t* d, int n) {
         collecting_ = false; groupLen_ = 0;
         dataGroup(g.data(), (int)g.size());
     }
+}
+
+// One dynamic label segment without its CRC: prefix = toggle, first, last, command flag, 4 bit field 1 (length - 1, or the command);
+// second byte: field 2 (character set in the first segment, else the segment number in bits 6..4)
+void DabPadDecoder::labelSegment(const uint8_t* d, int n) {
+    const int toggle = d[0] >> 7;
+    const bool first = d[0] & 0x40, last = d[0] & 0x20, cmd = d[0] & 0x10;
+    if (cmd) { if ((d[0] & 0x0F) == 1) { label_.clear(); dlsParts_.clear(); dlsLast_ = -1; } return; }   // command 1: clear the display
+    const int segNo = first ? 0 : (d[1] >> 4) & 7;
+    if (toggle != dlsToggle_ || (first && !dlsParts_.empty() && dlsParts_.count(0) && dlsParts_[0] != std::vector<uint8_t>(d + 2, d + n))) {
+        dlsParts_.clear(); dlsLast_ = -1; dlsToggle_ = toggle;     // a new label
+    }
+    if (first) dlsCharset_ = d[1] >> 4;
+    dlsParts_[segNo].assign(d + 2, d + n);
+    if (last) dlsLast_ = segNo;
+    if (dlsLast_ < 0 || (int)dlsParts_.size() != dlsLast_ + 1 || !dlsParts_.count(0)) return;
+    std::vector<uint8_t> all;
+    for (auto& kv : dlsParts_) { if (kv.first > dlsLast_) return; all.insert(all.end(), kv.second.begin(), kv.second.end()); }
+    label_ = text::clean(text::dabCharset(dlsCharset_, all.data(), all.size()));
 }
 
 void DabPadDecoder::dataGroup(const uint8_t* d, int n) {
