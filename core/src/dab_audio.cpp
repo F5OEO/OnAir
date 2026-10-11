@@ -1,6 +1,7 @@
 // DAB / DAB+ audio: superframe assembly (Reed-Solomon, firecode, access units) and decoding with FFmpeg.
 #include "dect2/dab.h"
 #include "dect2/audioout.h"
+#include "dect2/dab_pad.h"
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
@@ -19,6 +20,8 @@ struct DabAudio::Impl {
     AudioOut out;
     bool silent = false, outStarted = false;
     DabAudioStats st;
+    DabPadDecoder pad;
+    uint64_t slideEpoch = 0;     // pictures of the services selected before, so that the sequence number never goes back
     std::function<void(const uint8_t*, int, uint8_t)> auTap;
     float volume = 1.f; bool muted = false;
 
@@ -173,6 +176,7 @@ struct DabAudio::Impl {
             if (len >= 3 && dab::crc16(au, len - 2) == (uint16_t)((au[len - 2] << 8) | au[len - 1])) {
                 st.auOk++;
                 if (auTap) auTap(au, len - 2, hdr);
+                pad.accessUnit(au, len - 2);
                 decodePacket(au, len - 2);
             } else st.auBad++;
         }
@@ -191,6 +195,8 @@ void DabAudio::select(int sub, bool dabPlus, int bitrate) {
     I.synced = false; I.since = 0; I.consecBad = 0;
     I.dabPlus = dabPlus; I.bitrate = bitrate;
     I.st = DabAudioStats();
+    I.slideEpoch += I.pad.seq() + 1;
+    I.pad.reset();
     I.st.sub = sub; I.st.dabPlus = dabPlus; I.st.bitrate = bitrate;
     if (!dabPlus && sub >= 0) I.openMp2();
     if (I.outStarted) I.out.flush();
@@ -236,6 +242,18 @@ DabAudioStats DabAudio::stats() const {
 void DabAudio::setVolume(float v) { p_->volume = v; if (p_->outStarted) p_->out.setVolume(v); }
 void DabAudio::setMuted(bool m) { p_->muted = m; if (p_->outStarted) p_->out.setMuted(m); }
 void DabAudio::setAuTap(std::function<void(const uint8_t*, int, uint8_t)> cb) { p_->auTap = std::move(cb); }
+bool DabAudio::slide(DabSlide& out, uint64_t lastSeq) const {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    const uint64_t seq = p_->slideEpoch + p_->pad.seq();
+    if (seq == lastSeq) return false;
+    out = p_->pad.slide();
+    out.seq = seq;
+    return true;
+}
+std::string DabAudio::dynamicLabel() const {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    return p_->pad.label();
+}
 void DabAudio::setSilent(bool s) { p_->silent = s; }
 
 } // namespace dect2

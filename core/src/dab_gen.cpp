@@ -212,13 +212,16 @@ struct Transmitter::Impl {
         std::vector<float> pcm(960 * 2);
         auto block = [&](int64_t j) { for (int i = 0; i < 960; i++) for (int c = 0; c < 2; c++) pcm[(size_t)i * 2 + (size_t)c] = testSound(sv, c, floorMod(j, K) * 960 + i); };
         std::vector<uint8_t> raw;
+        const std::vector<std::vector<uint8_t>> dse = sv.slide ? slideDse((size_t)Kp) : std::vector<std::vector<uint8_t>>();
         block(Kp - 1);                                    // the block before the loop starts (the loop is periodic)
         enc.encode(pcm.data(), len[0] - 2, raw);
         s.aus.clear();
         for (int j = 0; j < Kp; j++) {
             block(j);
             const int budget = len[(size_t)(j % s.nAu)] - 2;
-            enc.encode(pcm.data(), budget, raw);
+            const size_t pad = (size_t)j < dse.size() ? dse[(size_t)j].size() : 0;       // the PAD takes its bytes from the audio
+            enc.encode(pcm.data(), budget - (int)pad, raw);
+            if (pad) raw.insert(raw.begin(), dse[(size_t)j].begin(), dse[(size_t)j].end());
             const uint16_t crc = crc16(raw.data(), budget);
             raw.push_back((uint8_t)(crc >> 8)); raw.push_back((uint8_t)crc);
             s.aus.push_back(raw);
@@ -628,6 +631,7 @@ dabgen::TxConfig dabDemoConfig() {
     dabgen::TxConfig tc;
     tc.services = dabgen::defaultServices();
     tc.services.push_back(dabgen::dmbService());
+    tc.services[2].slide = true;   // "OnAir Melody" sends a picture
     tc.tii = {{1, 1, 0.0}, {1, 3, -5.0}, {1, 7, -11.0}};
     return tc;
 }

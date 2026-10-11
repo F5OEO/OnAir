@@ -592,8 +592,12 @@ bool DabReceiver::telemetry(DabTelemetry& out, uint64_t lastSeq) {
 }
 
 DabEnsemble DabReceiver::ensemble() const {
+    const int sub = p_->audio.stats().sub;
+    const std::string dls = sub >= 0 ? p_->audio.dynamicLabel() : std::string();
     std::lock_guard<std::mutex> lk(p_->mu);
-    return p_->ens;
+    DabEnsemble e = p_->ens;
+    if (!dls.empty()) for (auto& kv : e.services) { const DabComponent* c = kv.second.playable(); if (c && c->subId == sub) kv.second.dls = dls; }
+    return e;
 }
 
 void DabReceiver::select(int subId) {
