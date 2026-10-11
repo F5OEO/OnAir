@@ -38,6 +38,8 @@ struct State {
     char fAir[24] = "";                  // filter: address, registration or flight contains this
     char fText[32] = "";                 // filter: the summary or detail contains this
     int fKind = 0;                       // 0 all, 1 ACARS, 2 ATN (X.25 / CLNP), 3 link (XID, S, U)
+    double fChan = 0;                    // channel filter: the channel's frequency in Hz, 0 = any
+    int fFrame = 0;                      // frame type: 0 any, 1 I, 2 S (RR, RNR, REJ), 3 UI, 4 XID (all), 5 GSIF, 6 link establishment, 7 handoff, 8 other U
     uint64_t selected = 0;
     char chans[160] = "";                // channel list in MHz, empty = the European six
     char pushedChans[160] = "\x01";
@@ -129,6 +131,23 @@ bool passes(const dect2::Vdl2Telemetry& t, const dect2::Vdl2Message& m) {
     if (S.fKind == 1 && !m.acars) return false;
     if (S.fKind == 2 && !(m.proto == "X.25" || m.proto == "CLNP" || m.proto == "COTP" || m.proto == "ES-IS" || m.proto == "IDRP")) return false;
     if (S.fKind == 3 && (m.acars || m.frameKind == 'I')) return false;
+    if (S.fChan > 0 && std::fabs(m.freqHz - S.fChan) > 1000) return false;
+    if (S.fFrame) {
+        const std::string& f = m.frameName;
+        const bool xid = f == "GSIF" || f.compare(0, 3, "XID") == 0;
+        bool ok = false;
+        switch (S.fFrame) {
+        case 1: ok = m.frameKind == 'I'; break;
+        case 2: ok = m.frameKind == 'S'; break;
+        case 3: ok = f == "UI"; break;
+        case 4: ok = xid; break;
+        case 5: ok = f == "GSIF"; break;
+        case 6: ok = f == "XID_CMD_LE" || f == "XID_RSP_LE"; break;
+        case 7: ok = f == "XID_CMD_HO" || f == "XID_RSP_HO"; break;
+        case 8: ok = m.frameKind == 'U' && f != "UI" && !xid; break;
+        }
+        if (!ok) return false;
+    }
     if (S.fAir[0]) {
         const std::string s = who(t, m.src, m.srcType) + " " + who(t, m.dst, m.dstType) + " " + m.reg + " " + m.flight;
         if (!contains(s, S.fAir)) return false;
@@ -137,7 +156,7 @@ bool passes(const dect2::Vdl2Telemetry& t, const dect2::Vdl2Message& m) {
     return true;
 }
 
-void filterRow() {
+void filterRow(const dect2::Vdl2Telemetry& t) {
     ImGui::TextDisabled("Aircraft / flight"); ImGui::SameLine(0, 5 * gUi);
     ImGui::SetNextItemWidth(150 * gUi);
     ImGui::InputTextWithHint("##vdfa", "ICAO, reg, flight", S.fAir, sizeof S.fAir);
@@ -150,6 +169,27 @@ void filterRow() {
     ImGui::SetNextItemWidth(110 * gUi);
     static const char* kinds[] = {"all frames", "ACARS", "ATN (X.25)", "link (XID, S, U)"};
     ImGui::Combo("##vdfk", &S.fKind, kinds, 4);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("What the frame carries.");
+    flowNext(8 * gUi);
+    ImGui::SetNextItemWidth(150 * gUi);
+    static const char* frames[] = {"any frame type", "I (information)", "S (RR, RNR, REJ)", "UI", "XID (all)", "GSIF", "XID link establishment", "XID handoff", "other U (DISC, UA, DM, TEST)"};
+    ImGui::Combo("##vdff", &S.fFrame, frames, 9);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show only this kind of AVLC frame.");
+    flowNext(8 * gUi);
+    ImGui::SetNextItemWidth(120 * gUi);
+    {
+        char cur[24];
+        if (S.fChan > 0) snprintf(cur, sizeof cur, "%.3f MHz", S.fChan / 1e6); else snprintf(cur, sizeof cur, "any channel");
+        if (ImGui::BeginCombo("##vdfc", cur)) {
+            if (ImGui::Selectable("any channel", S.fChan <= 0)) S.fChan = 0;
+            for (const auto& c : t.channels) {
+                char l[24]; snprintf(l, sizeof l, "%.3f MHz", c.freqHz / 1e6);
+                if (ImGui::Selectable(l, std::fabs(S.fChan - c.freqHz) < 1000)) S.fChan = c.freqHz;
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show only the frames received on this channel.");
+    }
     flowEnd();
 }
 
@@ -185,7 +225,7 @@ void detailPane(const App& a, const dect2::Vdl2Telemetry& t, const dect2::Vdl2Me
 void messageView(App& a) {
     const dect2::Vdl2Telemetry& t = a.rx.vdl2;
     const bool on = live(a);
-    filterRow();
+    filterRow(t);
     const float H = ImGui::GetContentRegionAvail().y;
     const float listH = std::max(120.f * gUi, H * 0.55f);
     const dect2::Vdl2Message* sel = nullptr;
