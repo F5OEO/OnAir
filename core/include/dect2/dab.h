@@ -1,6 +1,7 @@
 // DAB / DAB+ receiver (ETSI EN 300 401, TS 102 563), transmission mode I (Band III, 1.536 MHz, 1536 carriers).
 #pragma once
 #include "dab_dmb.h"
+#include "dab_pad.h"
 #include "dab_tel.h"
 #include "ring.h"
 #include <cstdint>
@@ -83,6 +84,8 @@ public:
     void push(const uint8_t* frame, int n);              // one 24 ms logical frame
     void flushSync();                                    // the stream was interrupted
     DabAudioStats stats() const;
+    // The slide show picture last received in the PAD of the selected DAB+ service (empty after select()). false when its seq is lastSeq.
+    bool slide(DabSlide& out, uint64_t lastSeq) const;
     void setVolume(float v);
     void setMuted(bool m);
     // Tests: receives every access unit with a good CRC (raw AAC frame) and its superframe header

@@ -76,6 +76,7 @@ struct TxService {
     bool dmb = false;                   // a DMB video service instead of audio (TS 102 428 profile 2: H.264 and AAC; dab_gen_dmb.cpp)
     int sampleRate = 48000;             // DAB+: 48000 or 32000; DAB: 48000
     double leftHz = 1000, rightHz = 3000;   // the tones (periods that divide the frame length)
+    bool slide = false;                 // DAB+: a slide show picture (a small PNG) in the PAD, once per 12 s loop
     bool melody = false;                // a tune instead of the tones (12 s, left: the tune, right: the same an octave higher)
     double amplitude = 0.5;             // peak of every channel, 1.0 = full scale
     int option = 0, level = 2;          // EEP-3A
@@ -101,6 +102,12 @@ std::vector<TxService> defaultServices();
 // (QCIF) at 12.5 pictures per second in H.264, and AAC-LC 32 kHz stereo tones (1 kHz left, 500 Hz right). The app's test signal carries it
 // after the defaultServices().
 TxService dmbService();
+
+// The slide of a service with TxService::slide: a PNG (80 x 60, palette) and its pixels, and the data stream element (PAD) that goes in front of
+// access unit j of the loop, empty when there is none
+std::vector<uint8_t> slidePng();
+void slideImage(int& w, int& h, std::vector<uint8_t>& rgba);
+std::vector<std::vector<uint8_t>> slideDse(size_t nAu);
 
 struct SubLayout { int subId, start, size, bitrate, option, level, uep = -1; };
 

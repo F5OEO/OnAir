@@ -205,6 +205,24 @@ void dabSelectStation(App& a, int sub, bool play) {
     } else a.engine.dabSelect(-1);
 }
 
+// The slide show picture the selected DAB+ service sends in its PAD: kept as a texture while the picture lasts
+static struct DabSlideView {
+    uint64_t seq = 0;
+    gfx::Image* img = nullptr;
+    int w = 0, h = 0;
+    std::string name;
+} gDabSlide;
+static void dabSlideUpdate(App& a) {
+    DabSlide s;
+    if (!gGfx || !a.engine.dabAudio().slide(s, gDabSlide.seq)) return;
+    gDabSlide.seq = s.seq;
+    delete gDabSlide.img;
+    gDabSlide.img = nullptr; gDabSlide.w = gDabSlide.h = 0; gDabSlide.name.clear();
+    if (s.w <= 0 || s.h <= 0 || s.rgba.size() < (size_t)s.w * (size_t)s.h * 4) return;
+    gDabSlide.img = gGfx->createImage(s.w, s.h, 0xFF000000u);
+    gDabSlide.img->update(0, 0, s.w, s.h, reinterpret_cast<const uint32_t*>(s.rgba.data()));
+    gDabSlide.w = s.w; gDabSlide.h = s.h; gDabSlide.name = s.name;
+}
 void dabStations(App& a) {
     const bool run = a.engine.running();
     const DabEnsemble ens = a.engine.dabEnsemble();
@@ -293,6 +311,24 @@ void dabStations(App& a) {
         std::string dls;
         for (const auto& kv : ens.services) { const DabComponent* ac = kv.second.playable(); if (ac && ac->subId == cur) { name = kv.second.label; dls = kv.second.dls; } }
         if (video && a.video.has()) { a.video.draw(ImGui::GetContentRegionAvail()); ImGui::EndChild(); return; }   // the DMB picture, drawn as the TV modes draw theirs
+        dabSlideUpdate(a);
+        if (cur >= 0 && gDabSlide.img) {   // the station's picture under its name, as large as the box allows
+            const float bw = ImGui::GetContentRegionAvail().x;
+            const ImVec2 ns = ImGui::CalcTextSize(name.c_str());
+            ImGui::SetCursorPosX(std::max(0.f, (bw - ns.x) * 0.5f));
+            ImGui::TextUnformatted(name.c_str());
+            const float dlsH = dls.empty() ? 0.f : ImGui::CalcTextSize(dls.c_str(), nullptr, false, std::max(1.f, bw - 16)).y + ImGui::GetStyle().ItemSpacing.y;
+            const ImVec2 av = ImGui::GetContentRegionAvail();
+            const float sc = std::min(std::min(av.x / (float)gDabSlide.w, (av.y - dlsH) / (float)gDabSlide.h), 4.f);
+            if (sc > 0.f) {
+                const ImVec2 sz((float)gDabSlide.w * sc, (float)gDabSlide.h * sc);
+                ImGui::SetCursorPosX(std::max(0.f, (bw - sz.x) * 0.5f));
+                ImGui::Image(gDabSlide.img->texture(), sz);
+            }
+            if (!dls.empty()) { ImGui::SetCursorPosX(8); ImGui::PushTextWrapPos(bw - 8); ImGui::TextDisabled("%s", dls.c_str()); ImGui::PopTextWrapPos(); }
+            ImGui::EndChild();
+            return;
+        }
         const ImVec2 p = ImGui::GetCursorScreenPos();
         const float cw = ImGui::GetContentRegionAvail().x;
         if (!pal::dev()) icons::draw(Ic::Radio, ImVec2(p.x + cw * 0.5f, p.y + 28), 36.f, cur >= 0 ? pal::remap(IM_COL32(120, 200, 255, 255)) : IM_COL32(70, 80, 92, 255));
