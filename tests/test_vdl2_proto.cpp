@@ -2,6 +2,7 @@
 // HDLC framing, AVLC addresses, and the decoders of what the frames carry (ACARS with ADS-C, X.25 / CLNP / COTP, XID).
 #include "dect2/vdl2_proto.h"
 #include "dect2/aero_adsc.h"
+#include "dect2/vdl2_app.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -137,6 +138,85 @@ int main() {
         Vdl2Message a;
         CHECK(vdl2ParseFrame(le.data(), le.size() - 2, a) && a.frameName == "XID_CMD_LE" && a.hasPos && std::fabs(a.lat + 33.9) < 0.01 && std::fabs(a.lon - 151.2) < 0.01 && a.altFt == 37000, "LE %s", a.frameName.c_str());
         printf("  XID: %s / %s\n", m.summary.c_str(), a.summary.c_str());
+    }
+    // the layers dumpvdl2 names: compressed CLNP, ES-IS, IDRP, COTP connect, SNDCF, X.25 clear, pieces joined
+    {
+        const Vdl2Addr gs{0x10A000, 4, false}, ac{0x4CA2B1, 1, false};
+        auto parse = [&](const std::vector<uint8_t>& info, Vdl2Reasm* rs, double t, Vdl2Message& m, bool air = true) {
+            const auto fr = vdl2Frame(air ? gs : ac, air ? ac : gs, vdl2ControlI(0, 0, false), info);
+            return vdl2ParseFrame(fr.data(), fr.size() - 2, m, rs, t);
+        };
+        auto x25 = [](int ps, bool more, const std::vector<uint8_t>& user) {
+            std::vector<uint8_t> o = {0x10, 0x01, (uint8_t)(((ps & 7) << 1) | (more ? 0x10 : 0))};
+            o.insert(o.end(), user.begin(), user.end());
+            return o;
+        };
+        // compressed header (type 0, no segmentation) carrying a COTP CR with a TPDU size and a transport selector
+        const std::vector<uint8_t> cr = {13, 0xE0, 0x00, 0x00, 0x00, 0x01, 0x40, 0xC0, 0x01, 0x0B, 0xC2, 0x02, 0x00, 0x01};
+        std::vector<uint8_t> comp = {0x01, 120, 0x00, 0x05};   // type 0, priority 1, lifetime 60 s, local reference 5
+        comp[0] = 0x01;
+        comp.insert(comp.end(), cr.begin(), cr.end());
+        Vdl2Message m;
+        CHECK(parse(x25(0, false, comp), nullptr, 0, m), "parse compressed");
+        CHECK(m.detail.find("compressed header") != std::string::npos && m.detail.find("local reference 5") != std::string::npos && m.detail.find("CR (connection request)") != std::string::npos &&
+              m.detail.find("TPDU size 2048 octets") != std::string::npos && m.detail.find("called / responding transport selector 0001") != std::string::npos, "%s", m.detail.c_str());
+        // CPDLC from the air, octets as received on 136.775 / 136.825 MHz and read the same by dumpvdl2
+        {
+            auto hex = [](const char* h) { std::vector<uint8_t> v; for (size_t i = 0; h[i]; i += 2) v.push_back((uint8_t)strtol(std::string(h + i, 2).c_str(), nullptr, 16)); return v; };
+            const Vdl2AppResult w = vdl2AtnApp(hex("00A7264F31443D2A88EE00008286024F54").data(), 17, true);
+            CHECK(w.decoded && w.summary == "CPDLC WILCO" && w.detail.find("id 5, reference 4, 2026-10-11 17:07:28, logical acknowledgement required") != std::string::npos, "%s", w.detail.c_str());
+            const Vdl2AppResult l = vdl2AtnApp(hex("00A7164EE2493D2A88EB832103CB921EA8").data(), 17, true);
+            CHECK(l.decoded && l.summary == "CPDLC LOGICAL ACKNOWLEDGEMENT" && l.detail.find("id 9, reference 9, 2026-10-11 17:07:23") != std::string::npos, "%s", l.detail.c_str());
+            const Vdl2AppResult c = vdl2AtnApp(hex("00A6C64D900F4AA23D006320BB33D298").data(), 16, true);
+            CHECK(c.decoded && c.summary == "CPDLC CURRENT DATA AUTHORITY" && c.detail.find("id 0, 2026-10-11 17:07:40") != std::string::npos, "%s", c.detail.c_str());
+            const Vdl2AppResult r = vdl2AtnApp(hex("002808C36004E2C9DC5127A5511E700020A05C197B").data(), 21, true);
+            CHECK(r.decoded && r.detail.find("release response, reason normal") != std::string::npos && r.detail.find("DM0 WILCO") != std::string::npos, "%s", r.detail.c_str());
+            // octets cut short are not read
+            CHECK(!vdl2AtnApp(hex("00A7264F31443D2A88EE0000828602").data(), 15, true).decoded, "cut short");
+        }
+        // ES-IS hello with the mobile subnetwork capabilities
+        std::vector<uint8_t> ish = {0x82, 0, 1, 0, 4, 0, 30, 0, 0, 3, 0x47, 0x00, 0x27, 0x81, 0x01, 0x03};
+        ish[1] = (uint8_t)ish.size();
+        Vdl2Message e;
+        CHECK(parse(x25(1, false, ish), nullptr, 0, e) && e.proto == "ES-IS" && e.summary.find("IS hello") != std::string::npos && e.detail.find("hold time 30 s") != std::string::npos &&
+              e.detail.find("ATS, AOC") != std::string::npos, "%s", e.detail.c_str());
+        // IDRP keepalive
+        std::vector<uint8_t> idrp(30, 0);
+        idrp[0] = 0x85; idrp[2] = 30; idrp[3] = 4; idrp[7] = 9;
+        Vdl2Message k;
+        CHECK(parse(x25(2, false, idrp), nullptr, 0, k) && k.proto == "IDRP" && k.summary.find("KEEPALIVE") != std::string::npos && k.detail.find("seq 9") != std::string::npos, "%s", k.detail.c_str());
+        // X.25 call request with the SNDCF, clear request with its cause
+        Vdl2Message q;
+        CHECK(parse(vdl2X25CallRequest(1, "1234", "56789"), nullptr, 0, q) && q.detail.find("ICAO SNDCF: version 1, compression none") != std::string::npos, "%s", q.detail.c_str());
+        Vdl2Message cl;
+        CHECK(parse({0x10, 0x01, 0x13, 0x09, 0xF1}, nullptr, 0, cl) && cl.detail.find("remote procedure error") != std::string::npos && cl.detail.find("higher level initiated disconnect (normal)") != std::string::npos, "%s", cl.detail.c_str());
+        // one CLNP DT cut in two X.25 packets (M bit): the first shows nothing decoded, the second the whole
+        std::vector<uint8_t> src(20, 0x11), dst(20, 0x22), user(40);
+        for (size_t i = 0; i < user.size(); i++) user[i] = (uint8_t)i;
+        const auto whole = vdl2X25ClnpData(1, 0, 0, src, dst, user);
+        const std::vector<uint8_t> body(whole.begin() + 3, whole.end());
+        const size_t cut = body.size() / 2;
+        Vdl2Reasm rs;
+        Vdl2Message p1, p2;
+        CHECK(parse(x25(3, true, std::vector<uint8_t>(body.begin(), body.begin() + (long)cut)), &rs, 1.0, p1) && p1.detail.find("piece 1 of a longer message") != std::string::npos && p1.proto == "X.25", "%s", p1.detail.c_str());
+        CHECK(parse(x25(4, false, std::vector<uint8_t>(body.begin() + (long)cut, body.end())), &rs, 1.5, p2) && p2.detail.find("joined from 2 packets") != std::string::npos &&
+              p2.detail.find("CLNP: DT") != std::string::npos && p2.detail.find("ATN application data, 40 octets") != std::string::npos, "%s", p2.detail.c_str());
+        // the same pieces much later do not join
+        Vdl2Message p3, p4;
+        CHECK(parse(x25(3, true, std::vector<uint8_t>(body.begin(), body.begin() + (long)cut)), &rs, 10.0, p3), "p3");
+        CHECK(parse(x25(4, false, std::vector<uint8_t>(body.begin() + (long)cut, body.end())), &rs, 400.0, p4) && p4.detail.find("joined") == std::string::npos, "%s", p4.detail.c_str());
+        // CLNP segments (compressed header, derived type 7 then 6) joined by offset
+        std::vector<uint8_t> payload = cr;
+        auto seg = [&](int type, uint16_t off, size_t from, size_t to) {
+            std::vector<uint8_t> o = {(uint8_t)((type << 4) | 1), 120, 0x00, 0x05, 0x00, 0x42, (uint8_t)(off >> 8), (uint8_t)off, 0x00, (uint8_t)payload.size()};
+            o.insert(o.end(), payload.begin() + (long)from, payload.begin() + (long)to);
+            return o;
+        };
+        Vdl2Reasm r2;
+        Vdl2Message s1, s2;
+        CHECK(parse(x25(0, false, seg(7, 0, 0, 6)), &r2, 2.0, s1) && s1.detail.find("waiting for the rest") != std::string::npos, "%s", s1.detail.c_str());
+        CHECK(parse(x25(1, false, seg(6, 6, 6, payload.size())), &r2, 2.2, s2) && s2.detail.find("joined from 2 segments") != std::string::npos && s2.detail.find("CR (connection request)") != std::string::npos, "%s", s2.detail.c_str());
+        printf("  layers: %s | %s | %s\n", m.summary.c_str(), e.summary.c_str(), k.summary.c_str());
     }
     printf(fails ? "vdl2 proto: %d FAILED\n" : "vdl2 proto: all passed\n", fails);
     return fails ? 1 : 0;

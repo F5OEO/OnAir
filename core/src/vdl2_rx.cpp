@@ -111,6 +111,7 @@ struct Vdl2Receiver::Impl {
     // results
     Vdl2Telemetry tel;
     uint64_t serial = 0, seq = 0;
+    Vdl2Reasm reasm;                       // X.25 / CLNP / COTP pieces waiting for the rest of their message (receiver thread only)
     double lastGood = -1e9, lastBurst = -1e9;
     float lastSnr = 0;
 
@@ -377,7 +378,7 @@ struct Vdl2Receiver::Impl {
             for (const auto& f : frames) {
                 if (f.size() < 11 || !vdl2FcsOk(f.data(), f.size())) { bad++; continue; }
                 Vdl2Message m;
-                if (!vdl2ParseFrame(f.data(), f.size() - 2, m)) { bad++; continue; }
+                if (!vdl2ParseFrame(f.data(), f.size() - 2, m, &reasm, tSec)) { bad++; continue; }
                 m.timeSec = tSec; m.wallTime = (int64_t)time(nullptr); m.freqHz = k.freqHz; m.levelDb = o.levelDb; m.snrDb = o.snrDb; m.cfoHz = (float)(o.cfoHz + tuneErr); m.rsFixed = fixed;
                 good++;
                 addMessage(std::move(m), corr, fixed, good == 1);

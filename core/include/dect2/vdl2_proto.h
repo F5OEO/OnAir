@@ -17,6 +17,7 @@
 #include "vdl2_tel.h"
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -73,8 +74,20 @@ std::vector<uint8_t> vdl2Frame(const Vdl2Addr& dst, const Vdl2Addr& src, uint8_t
 uint8_t vdl2ControlI(int ns, int nr, bool p);
 constexpr uint8_t kVdl2CtrlUI = 0x03, kVdl2CtrlXID = 0xAF;          // U frames (P/F 0); add 0x10 for P/F
 
-// Decodes a frame whose FCS was good (n without the FCS). False when it is too short to be AVLC.
-bool vdl2ParseFrame(const uint8_t* f, size_t n, Vdl2Message& m);
+// What the layers above AVLC keep from one frame to the next: X.25 packet sequences (M bit), CLNP segments and COTP data TPDUs of one
+// conversation, joined when the last piece arrives. Keys are built from the AVLC addresses (and the PDU id / reference).
+class Vdl2Reasm {
+public:
+    struct Seq { std::vector<uint8_t> data; uint32_t next = 0; int pieces = 0; double last = 0; };
+    struct Segs { std::map<uint32_t, std::vector<uint8_t>> part; uint32_t total = 0; bool final = false; uint32_t finalEnd = 0; double last = 0; };
+    std::map<uint64_t, Seq> x25, cotp;
+    std::map<uint64_t, Segs> clnp;
+    void prune(double now);                                        // drops what has waited longer than a conversation could
+};
+
+// Decodes a frame whose FCS was good (n without the FCS). False when it is too short to be AVLC. `rs` (may be null) joins the pieces of
+// X.25 / CLNP / COTP messages; `now` is the signal time in seconds, which ages them.
+bool vdl2ParseFrame(const uint8_t* f, size_t n, Vdl2Message& m, Vdl2Reasm* rs = nullptr, double now = 0);
 
 // ---- information field builders (test signal, tests) ----
 std::vector<uint8_t> vdl2AcarsInfo(const std::string& reg, const std::string& label, char blockId, const std::string& text, char ack = 0x15, char mode = '2');
