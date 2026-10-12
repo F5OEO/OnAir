@@ -405,6 +405,7 @@ bool Engine::start(const DeviceInfo& dev, const TuneSettings& tune, const FileOp
             log(m);
         }
     logIMode_ = logIGi_ = logITmcc_ = -1; logISync_ = false;
+    rxA3_.setPaced(true);
     rxA3_.configure(rate_);
     rxA3_.setBlocking(!src_->realtimeHardware());
     rxA3_.setPacketCallback([this](const uint8_t* pk, size_t n, double secs) { onTsPackets(pk, n, secs); });   // runs on the ATSC 3.0 worker thread

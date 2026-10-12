@@ -24,6 +24,7 @@ void Atsc3Rx::configure(double rate) {
 void Atsc3Rx::start() {
     if (rate_ <= 0) return;
     rx_.reset(new Atsc3Receiver());
+    rx_->remux().setRealtime(paced_);
     sync_.reset(new Atsc3Sync(rate_, rx_.get()));
     sync_->setThreads(std::max(2, std::min(4, (int)std::thread::hardware_concurrency() / 2)));
     if (want_ >= 0) rx_->selectService(want_); else rx_->setAutoSelect(true);

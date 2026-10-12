@@ -54,6 +54,8 @@ struct Atsc3Remux::Impl {
     std::deque<uint8_t> out;
     bool outEnded = false;
     int startupWaitMs = 4000;
+    std::atomic<bool> realtime{false};
+    std::atomic<int> latencyMs{1200};
     std::atomic<int> nStreams{0};
     std::atomic<bool> hdr{false};
     std::thread muxThread;
@@ -212,6 +214,9 @@ struct Atsc3Remux::Impl {
         std::map<Comp*, int64_t> lastOut;   // the output time of the last packet taken from each component
         std::vector<int64_t> lastDts(oc->nb_streams, INT64_MIN);
         long idle = 0;
+        bool paced = false;
+        std::chrono::steady_clock::time_point wall0;
+        int64_t dts0 = 0;
         for (;;) {
             Comp* pick = nullptr;
             int64_t best = INT64_MAX;
@@ -289,6 +294,14 @@ struct Atsc3Remux::Impl {
                 }
                 if (pk->pts != AV_NOPTS_VALUE && pk->dts != AV_NOPTS_VALUE && pk->pts < pk->dts) pk->pts = pk->dts;
                 lastDts[os] = pk->dts;
+                if (realtime.load() && pk->dts != AV_NOPTS_VALUE) {   // release the packet when its time has come
+                    using clk = std::chrono::steady_clock;
+                    if (!paced) { paced = true; wall0 = clk::now() + std::chrono::milliseconds(latencyMs.load()); dts0 = pk->dts; }
+                    auto target = wall0 + std::chrono::microseconds((pk->dts - dts0) * 1000000 / 90000);
+                    auto now = clk::now();
+                    if (now > target + std::chrono::milliseconds(500)) wall0 += now - target;   // behind (nothing arrived for a while): start again from here
+                    while (!stopping.load() && clk::now() < target) std::this_thread::sleep_for(std::min<clk::duration>(target - clk::now(), std::chrono::milliseconds(20)));
+                }
                 pk->stream_index = os;
                 if (pk->pts != AV_NOPTS_VALUE && pk->pts >= 0) {
                     AVBSFContext* bsf = os < (int)bsfs.size() ? bsfs[os] : nullptr;
@@ -405,5 +418,6 @@ int Atsc3Remux::streamCount() const { return p_->nStreams; }
 bool Atsc3Remux::started() const { return p_->hdr; }
 std::vector<std::string> Atsc3Remux::droppedCodecs() const { std::lock_guard<std::mutex> lk(p_->mu); return p_->dropped; }
 void Atsc3Remux::setStartupWaitMs(int ms) { p_->startupWaitMs = ms; }
+void Atsc3Remux::setRealtime(bool on, int latencyMs) { p_->realtime = on; p_->latencyMs = latencyMs; }
 
 } // namespace dect2

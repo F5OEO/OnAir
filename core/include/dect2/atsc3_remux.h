@@ -31,6 +31,9 @@ public:
 
     // Waits (up to the given time) for components that have not shown an init segment before writing the header.
     void setStartupWaitMs(int ms);
+    // Paces the output to the timestamps: segments arrive in bursts (a second of picture at once), a player needs the pictures at their rate. The
+    // first packet leaves `latencyMs` after it was ready and the others by their timestamps; a stream that falls behind is anchored again.
+    void setRealtime(bool on, int latencyMs = 1200);
 
 private:
     struct Impl;

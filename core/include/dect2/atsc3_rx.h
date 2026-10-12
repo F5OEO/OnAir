@@ -36,6 +36,7 @@ public:
     void configure(double sampleRate);
     void reset();                                       // starts again from the next samples; the chosen service is kept
     void feed(const cf32* x, size_t n);
+    void setPaced(bool on) { paced_ = on; }             // the transport stream leaves at the rate of the programme, not in the bursts of the segments
     void setBlocking(bool b) { blocking_ = b; }         // recordings: wait when behind instead of dropping samples
     void setPacketCallback(std::function<void(const uint8_t*, size_t, double)> f) { cb_ = std::move(f); }
     void selectService(int serviceId);                  // -1: the first video service that appears
@@ -53,7 +54,7 @@ private:
     std::condition_variable cv_, cvSpace_;
     std::deque<std::vector<cf32>> q_;
     size_t queued_ = 0;
-    std::atomic<bool> stop_{true}, blocking_{false};
+    std::atomic<bool> stop_{true}, blocking_{false}, paced_{false};
     std::thread worker_, pump_;
     std::unique_ptr<atsc3::Atsc3Receiver> rx_;
     std::unique_ptr<atsc3::Atsc3Sync> sync_;
