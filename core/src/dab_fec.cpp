@@ -1,6 +1,7 @@
 // DAB channel coding: tables, CRCs, energy dispersal, the rate 1/4 convolutional code with puncturing (FIC and EEP sub-channels),
 // and the Reed-Solomon code of DAB+. Conventions verified against a live Band III ensemble.
 #include "dect2/dab.h"
+#include "dect2/simd.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -153,38 +154,65 @@ bool eepBlocks(int option, int level, int n, std::vector<Block>& out) {
 
 } // namespace
 
-void viterbiDecode(const int8_t* mother, int nbits, uint8_t* bits) {
-    const Trellis& T = trellis();
-    const int steps = nbits + 6;
-    static thread_local std::vector<uint64_t> dec;
-    dec.assign((size_t)steps, 0);
-    int32_t pm[64], nm[64];
-    for (int s = 0; s < 64; s++) pm[s] = -100000000;
-    pm[0] = 0;
-    // predecessor patterns of each next state
-    uint8_t pat0[64], pat1[64];
-    for (int ns = 0; ns < 64; ns++) {
-        const int b = ns >> 5, ps0 = (ns & 31) << 1;
-        pat0[ns] = T.out[ps0][b];
-        pat1[ns] = T.out[ps0 | 1][b];
-    }
-    for (int t = 0; t < steps; t++) {
-        const int s0 = mother[4 * t], s1 = mother[4 * t + 1], s2 = mother[4 * t + 2], s3 = mother[4 * t + 3];
-        int bm[16];
-        for (int p = 0; p < 16; p++) bm[p] = ((p & 1) ? s0 : -s0) + ((p & 2) ? s1 : -s1) + ((p & 4) ? s2 : -s2) + ((p & 8) ? s3 : -s3);
-        uint64_t d = 0;
+namespace {
+// Branch metric of a next state as a sum of the four soft bits, each weighted +1 or -1 by the code bit of the branch: sg[branch][bit][next state].
+// That replaces a 16 entry table looked up per state, which the compiler cannot vectorise.
+struct VitSigns { int16_t sg[2][4][64]; };
+
+const VitSigns& vitSigns() {
+    static const VitSigns v = [] {
+        VitSigns t{};
+        const Trellis& T = trellis();
         for (int ns = 0; ns < 64; ns++) {
-            const int ps0 = (ns & 31) << 1;
-            const int a = pm[ps0] + bm[pat0[ns]], b = pm[ps0 | 1] + bm[pat1[ns]];
-            if (b > a) { nm[ns] = b; d |= 1ull << ns; } else nm[ns] = a;
+            const int b = ns >> 5, ps0 = (ns & 31) << 1;
+            for (int br = 0; br < 2; br++) {
+                const int pat = T.out[ps0 | br][b];
+                for (int i = 0; i < 4; i++) t.sg[br][i][ns] = (pat >> i) & 1 ? 1 : -1;
+            }
         }
-        dec[(size_t)t] = d;
-        std::memcpy(pm, nm, sizeof pm);
+        return t;
+    }();
+    return v;
+}
+
+// The add-compare-select over all the steps, in 16 bit lanes (the vectoriser turns the 64 states into a few NEON / SSE / AVX2 vectors). Path metrics
+// of the even and odd predecessors are kept apart (pe, po), so the two candidates of a next state are read without a gather. The spread of the metrics
+// is at most 6 steps of 2 * 4 * 127, so renormalising every 16 steps keeps them inside 16 bits.
+DECT2_MULTIVERSION void vitForward(const int8_t* mother, int steps, const VitSigns& v, uint8_t* dec) {
+    alignas(32) int16_t pe[32], po[32], nm[64];
+    for (int j = 0; j < 32; j++) pe[j] = po[j] = -8000;
+    pe[0] = 0;   // the encoder starts in state 0
+    for (int t = 0; t < steps; t++) {
+        const int16_t s0 = mother[4 * t], s1 = mother[4 * t + 1], s2 = mother[4 * t + 2], s3 = mother[4 * t + 3];
+        uint8_t* d = dec + (size_t)t * 64;
+        for (int h = 0; h < 2; h++) {
+            const int16_t* a0 = v.sg[0][0] + 32 * h; const int16_t* a1 = v.sg[0][1] + 32 * h; const int16_t* a2 = v.sg[0][2] + 32 * h; const int16_t* a3 = v.sg[0][3] + 32 * h;
+            const int16_t* b0 = v.sg[1][0] + 32 * h; const int16_t* b1 = v.sg[1][1] + 32 * h; const int16_t* b2 = v.sg[1][2] + 32 * h; const int16_t* b3 = v.sg[1][3] + 32 * h;
+            for (int j = 0; j < 32; j++) {
+                const int16_t a = (int16_t)(pe[j] + a0[j] * s0 + a1[j] * s1 + a2[j] * s2 + a3[j] * s3);
+                const int16_t b = (int16_t)(po[j] + b0[j] * s0 + b1[j] * s1 + b2[j] * s2 + b3[j] * s3);
+                nm[32 * h + j] = b > a ? b : a;
+                d[32 * h + j] = b > a;
+            }
+        }
+        for (int j = 0; j < 32; j++) { pe[j] = nm[2 * j]; po[j] = nm[2 * j + 1]; }
+        if ((t & 15) == 15) {
+            const int16_t r = pe[0];
+            for (int j = 0; j < 32; j++) { pe[j] = (int16_t)(pe[j] - r); po[j] = (int16_t)(po[j] - r); }
+        }
     }
+}
+} // namespace
+
+void viterbiDecode(const int8_t* mother, int nbits, uint8_t* bits) {
+    const int steps = nbits + 6;
+    static thread_local std::vector<uint8_t> dec;
+    dec.resize((size_t)steps * 64);
+    vitForward(mother, steps, vitSigns(), dec.data());
     int state = 0;   // the tail forces the encoder back to state 0
     for (int t = steps - 1; t >= 0; t--) {
         if (t < nbits) bits[t] = (uint8_t)(state >> 5);
-        state = ((state & 31) << 1) | (int)((dec[(size_t)t] >> state) & 1);
+        state = ((state & 31) << 1) | (int)dec[(size_t)t * 64 + (size_t)state];
     }
 }
 
