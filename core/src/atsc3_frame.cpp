@@ -207,15 +207,25 @@ FrameResult decodeFrame(const cf32* x, size_t n, const Bootstrap& bs) {
                 pr.noise = (float)std::max(nsum / a.size, 0.002);
             } else if (bicm.ok() && pl.tiMode == 0 && pl.layer == 0 && a.size > 0) {
                 const int cb = bicm.cells();
+                const int first = std::min(std::max(pl.fecBlockStart, 0), a.size);   // the first complete FEC block starts here
+                const int whole = (a.size - first) / cb;
                 std::vector<std::vector<cf32>> blocks;
                 double nsum = 0;
-                for (int b = 0; b < a.size / cb; b++) {
+                for (int b = 0; b < whole; b++) {
                     blocks.emplace_back();
                     double ns;
-                    planeCells(b * cb, cb, blocks.back(), ns);
+                    planeCells(first + b * cb, cb, blocks.back(), ns);
                     nsum += ns;
                 }
-                if (!blocks.empty()) decodeBlocks(bicm, blocks, (float)std::max(nsum / (blocks.size() * cb), 0.002), pr);
+                const float nz = (float)std::max(nsum / std::max<double>(1.0, (double)blocks.size() * cb), 0.002);
+                if (!blocks.empty()) decodeBlocks(bicm, blocks, nz, pr);
+                if (first > 0 || first + whole * cb < a.size) {   // blocks across the frame boundaries
+                    pr.straddle = true;
+                    pr.noise = nz;
+                    double ns;
+                    planeCells(0, first, pr.head, ns);
+                    planeCells(first + whole * cb, a.size - first - whole * cb, pr.tail, ns);
+                }
             } else if (bicm.ok() && pl.tiMode == 2 && pl.layer == 0 && pl.htiInterSubframe == 0 && a.size > 0 && !pl.htiNumFecBlocks.empty()) {
                 // hybrid time interleaver inside the subframe: the interleaving frame is a few TI blocks, each deinterleaved on its own
                 const int cb = bicm.cells();

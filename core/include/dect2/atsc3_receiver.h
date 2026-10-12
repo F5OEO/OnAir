@@ -79,6 +79,9 @@ private:
     struct CtiPlp;
     PlpResult runCti(const PlpResult& in);          // de-interleaves a CTI PLP's cells in frame order and decodes the FEC blocks that are complete
     std::map<int, std::unique_ptr<CtiPlp>> cti_;   // by PLP id
+    struct Straddle { std::vector<cf32> tail; };
+    PlpResult joinStraddle(const PlpResult& in);    // the block made of the tail of the last frame and the head of this one goes in front of the whole blocks
+    std::map<int, Straddle> straddle_;
     Atsc3Remux remux_;
     ReceiverStats st_;
     FrameInfo info_;

@@ -108,6 +108,38 @@ PlpResult Atsc3Receiver::runCti(const PlpResult& in) {
     return out;
 }
 
+
+PlpResult Atsc3Receiver::joinStraddle(const PlpResult& in) {
+    Straddle& st = straddle_[in.id];
+    PlpResult out = in;
+    out.head.clear(); out.tail.clear(); out.straddle = false;
+    Bicm bicm(plpBicm(in.cfg));
+    const int cb = bicm.ok() ? bicm.cells() : 0;
+    if (cb > 0 && !in.head.empty()) {
+        // the first block of the frame: the end of the one the frame before left open
+        PlpResult first;
+        if (!st.tail.empty() && st.tail.size() + in.head.size() == (size_t)cb) {
+            std::vector<cf32> cells(st.tail);
+            cells.insert(cells.end(), in.head.begin(), in.head.end());
+            std::vector<const cf32*> ptr{cells.data()};
+            std::vector<std::vector<uint8_t>> pl;
+            std::vector<char> good;
+            bicm.decodeBatch(ptr, in.noise, pl, good);
+            first.blocks = 1;
+            first.ok.push_back(good[0] != 0);
+            if (good[0]) { bbScramble(pl[0]); first.packets.push_back(bitsToBytes(pl[0])); first.blocksOk = 1; }
+        } else {   // the frame before was lost or is not known yet: the block cannot be put together
+            first.blocks = 1;
+            first.ok.push_back(false);
+        }
+        out.ok.insert(out.ok.begin(), first.ok.begin(), first.ok.end());
+        out.packets.insert(out.packets.begin(), first.packets.begin(), first.packets.end());
+        out.blocks += first.blocks; out.blocksOk += first.blocksOk;
+    }
+    st.tail = in.tail;
+    return out;
+}
+
 bool Atsc3Receiver::pushFrame(const cf32* x, size_t n, const Bootstrap& bs) {
     return commitFrame(decodeFrame(x, n, bs), bs);
 }
@@ -116,7 +148,7 @@ bool Atsc3Receiver::commitFrame(const FrameResult& fr, const Bootstrap& bs) {
     {
         std::lock_guard<std::mutex> lk(mu_);
         st_.frames++;
-        if (!fr.ok) { st_.framesFailed++; cti_.clear(); return false; }
+        if (!fr.ok) { st_.framesFailed++; cti_.clear(); straddle_.clear(); return false; }
         FrameInfo fi;
         fi.valid = true;
         fi.fftSize = fr.subframe.fftSize; fi.guard = fr.subframe.guard;
@@ -134,10 +166,10 @@ bool Atsc3Receiver::commitFrame(const FrameResult& fr, const Bootstrap& bs) {
         info_ = fi;
     }
     std::vector<PlpResult> ctiOut;
-    for (auto& p : fr.plps) if (p.cti) ctiOut.push_back(runCti(p));
+    for (auto& p : fr.plps) if (p.cti) ctiOut.push_back(runCti(p)); else if (p.straddle) ctiOut.push_back(joinStraddle(p));
     size_t ci = 0;
     std::vector<const PlpResult*> todo;
-    for (auto& p : fr.plps) todo.push_back(p.cti ? &ctiOut[ci++] : &p);
+    for (auto& p : fr.plps) todo.push_back(p.cti || p.straddle ? &ctiOut[ci++] : &p);
     for (const PlpResult* pp : todo) {
         const PlpResult& p = *pp;
         // blocks that failed leave a gap: the packet reassembly restarts after it

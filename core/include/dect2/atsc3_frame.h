@@ -47,6 +47,11 @@ struct PlpResult {
     float noise = 0.1f;
     int ctiRows = 0, ctiStartRow = 0, ctiFecBlockStart = 0;
     FramePlp cfg;
+    // Without time interleaving the FEC blocks of a PLP run on from frame to frame: the frame starts with the end of the last block of the frame
+    // before (`head`), then whole blocks (decoded above), then the beginning of a block that ends in the next frame (`tail`). The receiver puts
+    // the tail of one frame and the head of the next together.
+    bool straddle = false;
+    std::vector<cf32> head, tail;
 };
 
 struct FrameResult {
