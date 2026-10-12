@@ -114,68 +114,132 @@ size_t frameLengthSamples(const Bootstrap& bs, const L1Basic& l1, const L1Detail
     return total;
 }
 
+// The parameters of subframe i of the frame (the first one comes from L1-Basic, the others from L1-Detail).
+static bool subframeParams(const L1Basic& l1, const L1Detail& d, int i, SubframeParams& s) {
+    if (i == 0) { s = subframeFrom(l1, d); return s.fftSize != 0 && s.guard != 0; }
+    if (i >= (int)d.subframes.size()) return false;
+    const L1DetailSubframe& q = d.subframes[(size_t)i];
+    s = SubframeParams();
+    s.fftSize = fftFromCode(q.fftSize);
+    s.cred = q.reducedCarriers;
+    s.guard = guardFromCode(q.guardInterval);
+    s.spPattern = q.scatteredPilotPattern;
+    s.spBoost = q.scatteredPilotBoost;
+    s.numSymbols = q.numOfdmSymbols + 1;
+    s.sbsFirst = q.sbsFirst;
+    s.sbsLast = q.sbsLast;
+    s.freqInterleaver = q.frequencyInterleaver;
+    s.sbsNullCells = q.sbsNullCells;
+    s.fiOffset = 0;   // the interleaver counts the symbols from the start of each later subframe (A/322 7.3)
+    return s.fftSize != 0 && s.guard != 0;
+}
+
+// Decodes FEC blocks of one PLP (cells of each block in `blocks`) in batches with the 8-bit decoder, into baseband packets.
+static void decodeBlocks(const Bicm& bicm, const std::vector<std::vector<cf32>>& blocks, float noise, PlpResult& pr) {
+    const size_t bs = 16;
+    for (size_t from = 0; from < blocks.size(); from += bs) {
+        const size_t to = std::min(blocks.size(), from + bs);
+        std::vector<const cf32*> in;
+        for (size_t i = from; i < to; i++) in.push_back(blocks[i].data());
+        std::vector<std::vector<uint8_t>> pl;
+        std::vector<char> good;
+        bicm.decodeBatch(in, noise, pl, good);
+        for (size_t i = 0; i < to - from; i++) {
+            pr.blocks++;
+            pr.ok.push_back(good[i] != 0);
+            if (good[i]) {
+                bbScramble(pl[i]);
+                pr.packets.push_back(bitsToBytes(pl[i]));
+                pr.blocksOk++;
+            }
+        }
+    }
+}
+
 FrameResult decodeFrame(const cf32* x, size_t n, const Bootstrap& bs) {
     FrameResult r;
     r.preamble = decodePreamble(x, n, bs);
     if (!r.preamble.basicOk || !r.preamble.detailOk || r.preamble.detail.subframes.empty()) return r;
     const L1Basic& l1 = r.preamble.basic;
     const L1Detail& d = r.preamble.detail;
-    SubframeParams s = subframeFrom(l1, d);
-    r.subframe = s;
-    if (s.fftSize == 0 || s.guard == 0) return r;
-    const size_t symLen = (size_t)s.fftSize + s.guard;
-    if (n < r.preamble.samples + symLen * s.numSymbols) return r;
-    std::vector<cf32> active;
-    std::vector<float> nv;
-    if (!demodulateSubframe(s, x + r.preamble.samples, n - r.preamble.samples, active, &nv)) return r;
-    // data cell indices of the first subframe start in the last Preamble symbol
-    std::vector<cf32> all(r.preamble.leftover);
-    std::vector<float> noise(all.size(), r.preamble.leftoverNoise);
-    all.insert(all.end(), active.begin(), active.end());
-    noise.insert(noise.end(), nv.begin(), nv.end());
-    for (auto& pl : d.subframes[0].plps) {
-        PlpResult pr;
-        pr.id = pl.id;
-        FramePlp fp; fp.fecType = pl.fecType; fp.mod = pl.mod; fp.cod = pl.cod;
-        BicmConfig bc = plpBicm(fp);
-        Bicm bicm(bc);
-        PlpAlloc a;
-        a.start = pl.start; a.size = pl.size; a.dispersed = pl.type == 1; a.numSubslices = pl.numSubslices; a.subsliceInterval = pl.subsliceInterval;
-        if (bicm.ok() && pl.tiMode == 1 && pl.layer == 0 && a.size > 0) {
-            pr.cti = true;
+    size_t pos = r.preamble.samples;   // the first sample of the subframe being read
+    const int nSub = std::min<int>(l1.numSubframes + 1, (int)d.subframes.size());
+    for (int si = 0; si < nSub; si++) {
+        SubframeParams s;
+        if (!subframeParams(l1, d, si, s)) return r;
+        if (si == 0) r.subframe = s;
+        const size_t symLen = (size_t)s.fftSize + s.guard;
+        if (n < pos + symLen * s.numSymbols) { if (si == 0) return r; break; }   // a later subframe that is cut off: what was read before it is still good
+        std::vector<cf32> active;
+        std::vector<float> nv;
+        if (!demodulateSubframe(s, x + pos, n - pos, active, &nv)) return r;
+        pos += symLen * s.numSymbols;
+        // the data cells of the first subframe start in the last Preamble symbol
+        std::vector<cf32> all;
+        std::vector<float> noise;
+        if (si == 0) { all = r.preamble.leftover; noise.assign(all.size(), r.preamble.leftoverNoise); }
+        all.insert(all.end(), active.begin(), active.end());
+        noise.insert(noise.end(), nv.begin(), nv.end());
+        for (auto& pl : d.subframes[(size_t)si].plps) {
+            PlpResult pr;
+            pr.id = pl.id;
+            FramePlp fp; fp.id = pl.id; fp.fecType = pl.fecType; fp.mod = pl.mod; fp.cod = pl.cod;
             pr.cfg = fp;
-            pr.ctiRows = ctiRows(pl.ctiDepth, pl.tiExtendedInterleaving != 0);
-            pr.ctiStartRow = pl.ctiStartRow; pr.ctiFecBlockStart = pl.ctiFecBlockStart;
-            pr.cells.resize((size_t)a.size);
-            double nsum = 0;
-            for (int i = 0; i < a.size; i++) {
-                long idx = plpCellIndex(a, i);
-                pr.cells[(size_t)i] = idx >= 0 && idx < (long)all.size() ? all[(size_t)idx] : cf32(0, 0);
-                nsum += idx >= 0 && idx < (long)noise.size() ? noise[(size_t)idx] : 0;
-            }
-            pr.noise = (float)std::max(nsum / a.size, 0.002);
-        } else if (bicm.ok() && pl.tiMode == 0 && pl.layer == 0 && a.size > 0) {
-            const int cb = bicm.cells();
-            pr.blocks = a.size / cb;
-            for (int b = 0; b < pr.blocks; b++) {
-                std::vector<cf32> cells(cb);
+            BicmConfig bc = plpBicm(fp);
+            Bicm bicm(bc);
+            PlpAlloc a;
+            a.start = pl.start; a.size = pl.size; a.dispersed = pl.type == 1; a.numSubslices = pl.numSubslices; a.subsliceInterval = pl.subsliceInterval;
+            auto planeCells = [&](int first, int count, std::vector<cf32>& cells, double& nsum) {
+                cells.resize((size_t)count);
+                nsum = 0;
+                for (int i = 0; i < count; i++) {
+                    long idx = plpCellIndex(a, first + i);
+                    cells[(size_t)i] = idx >= 0 && idx < (long)all.size() ? all[(size_t)idx] : cf32(0, 0);
+                    nsum += idx >= 0 && idx < (long)noise.size() ? noise[(size_t)idx] : 0;
+                }
+            };
+            if (bicm.ok() && pl.tiMode == 1 && pl.layer == 0 && a.size > 0) {
+                pr.cti = true;
+                pr.ctiRows = ctiRows(pl.ctiDepth, pl.tiExtendedInterleaving != 0);
+                pr.ctiStartRow = pl.ctiStartRow; pr.ctiFecBlockStart = pl.ctiFecBlockStart;
+                double nsum;
+                planeCells(0, a.size, pr.cells, nsum);
+                pr.noise = (float)std::max(nsum / a.size, 0.002);
+            } else if (bicm.ok() && pl.tiMode == 0 && pl.layer == 0 && a.size > 0) {
+                const int cb = bicm.cells();
+                std::vector<std::vector<cf32>> blocks;
                 double nsum = 0;
-                for (int i = 0; i < cb; i++) {
-                    long idx = plpCellIndex(a, b * cb + i);
-                    cells[i] = idx < (long)all.size() ? all[idx] : cf32(0, 0);
-                    nsum += idx < (long)noise.size() ? noise[idx] : 0;
+                for (int b = 0; b < a.size / cb; b++) {
+                    blocks.emplace_back();
+                    double ns;
+                    planeCells(b * cb, cb, blocks.back(), ns);
+                    nsum += ns;
                 }
-                std::vector<uint8_t> bits;
-                bool ok = bicm.decode(cells.data(), (float)std::max(nsum / cb, 0.002), bits);
-                pr.ok.push_back(ok);
-                if (ok) {
-                    bbScramble(bits);
-                    pr.packets.push_back(bitsToBytes(bits));
-                    pr.blocksOk++;
+                if (!blocks.empty()) decodeBlocks(bicm, blocks, (float)std::max(nsum / (blocks.size() * cb), 0.002), pr);
+            } else if (bicm.ok() && pl.tiMode == 2 && pl.layer == 0 && pl.htiInterSubframe == 0 && a.size > 0 && !pl.htiNumFecBlocks.empty()) {
+                // hybrid time interleaver inside the subframe: the interleaving frame is a few TI blocks, each deinterleaved on its own
+                const int cb = bicm.cells();
+                const int nTi = pl.htiNumTiBlocks + 1, nFecIf = pl.htiNumFecBlocks[0] + 1;
+                const int nFecMax = (pl.htiNumFecBlocksMax + 1 + nTi - 1) / nTi;   // per TI block: the columns of the twisted block interleaver
+                if ((long)nFecIf * cb <= a.size) {
+                    std::vector<std::vector<cf32>> blocks;
+                    double nsum = 0;
+                    int first = 0;
+                    for (int t = 0; t < nTi; t++) {
+                        const int nFec = htiBlocksInTiBlock(nFecIf, nTi, t);
+                        std::vector<cf32> ti;
+                        double ns;
+                        planeCells(first, nFec * cb, ti, ns);
+                        nsum += ns;
+                        first += nFec * cb;
+                        std::vector<cf32> de = htiDeinterleave(ti, cb, nFec, nFecMax, pl.htiCellInterleaver != 0);
+                        for (int f = 0; f < nFec && (size_t)(f + 1) * cb <= de.size(); f++) blocks.emplace_back(de.begin() + (size_t)f * cb, de.begin() + (size_t)(f + 1) * cb);
+                    }
+                    if (!blocks.empty()) decodeBlocks(bicm, blocks, (float)std::max(nsum / ((double)nFecIf * cb), 0.002), pr);
                 }
             }
+            r.plps.push_back(std::move(pr));
         }
-        r.plps.push_back(std::move(pr));
     }
     r.ok = true;
     return r;

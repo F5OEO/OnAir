@@ -123,13 +123,12 @@ bool Atsc3Receiver::commitFrame(const FrameResult& fr, const Bootstrap& bs) {
         fi.spDx = spDx(fr.subframe.spPattern); fi.spDy = spDy(fr.subframe.spPattern);
         fi.symbols = fr.subframe.numSymbols; fi.preambleSymbols = fr.preamble.numSymbols;
         fi.bootstrapMinor = bs.minorVersion; fi.bandwidthMhz = bs.systemBandwidth == 0 ? 6 : bs.systemBandwidth == 1 ? 7 : 8; fi.preambleStructure = bs.preambleStructure;
-        const auto& dp = fr.preamble.detail.subframes.empty() ? std::vector<L1DetailPlp>() : fr.preamble.detail.subframes[0].plps;
-        for (size_t i = 0; i < fr.plps.size() && i < dp.size(); i++) {
-            FramePlp q; q.fecType = dp[i].fecType; q.mod = dp[i].mod; q.cod = dp[i].cod;
-            BicmConfig bc = plpBicm(q);
+        for (size_t i = 0; i < fr.plps.size(); i++) {
+            const PlpResult& pr = fr.plps[i];
+            BicmConfig bc = plpBicm(pr.cfg);
             FrameInfo::Plp pi;
-            pi.id = fr.plps[i].id; pi.bitsPerCell = bc.bitsPerCell; pi.rate15 = bc.rate15; pi.nInner = bc.nInner;
-            pi.blocks = fr.plps[i].blocks; pi.blocksOk = fr.plps[i].blocksOk;
+            pi.id = pr.id; pi.bitsPerCell = bc.bitsPerCell; pi.rate15 = bc.rate15; pi.nInner = bc.nInner;
+            pi.blocks = pr.blocks; pi.blocksOk = pr.blocksOk;
             fi.plps.push_back(pi);
         }
         info_ = fi;
