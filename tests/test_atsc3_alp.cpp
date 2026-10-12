@@ -110,6 +110,23 @@ int main() {
     for (size_t i = 0; i < got.size() && i < expected.size(); i++) bad += !equal(got[i], expected[i]);
     printf("  %d ALP packets in %d baseband packets: %zu of %zu input packets back, %d wrong, %ld errors\n", (int)alpPackets.size(), bbCount, got.size(), expected.size(), bad, re.errors());
     CHECK(bad == 0 && re.errors() == 0, "reassembled packets match");
+
+    // A/330 5.4.4 TS header deletion: four packets with the same header and a continuity counter that counts on are sent with one header
+    {
+        std::vector<uint8_t> orig;
+        for (int i = 0; i < 4; i++) {
+            orig.push_back(0x47); orig.push_back(0x01); orig.push_back(0x31); orig.push_back((uint8_t)(0x10 | ((13 + i) & 15)));   // cc 13, 14, 15, 0
+            for (int j = 0; j < 184; j++) orig.push_back((uint8_t)rng());
+        }
+        std::vector<uint8_t> alp = {(uint8_t)(0xE0 | 4 << 1 | 1), 0x80};   // NUMTS 4, AHF, HDM 1, DNP 0
+        alp.insert(alp.end(), orig.begin() + 1, orig.begin() + 188);        // first packet complete, without the sync byte
+        for (int i = 1; i < 4; i++) alp.insert(alp.end(), orig.begin() + i * 188 + 4, orig.begin() + (i + 1) * 188);
+        CHECK(alp.size() == 2 + 187 + 3 * 184, "header deletion: packet length");
+        AlpReassembler r2;
+        std::vector<AlpPacket> g2;
+        r2.push(alp.data(), (int)alp.size(), 0, g2);
+        CHECK(g2.size() == 1 && g2[0].type == AlpTs && g2[0].data == orig, "header deletion: the TS headers and counters come back");
+    }
     printf(fails ? "atsc3 alp: FAILED\n" : "atsc3 alp: ok\n");
     return fails ? 1 : 0;
 }

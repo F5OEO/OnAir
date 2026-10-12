@@ -6,6 +6,8 @@
 #include "atsc3_ip.h"
 #include "atsc3_remux.h"
 #include "atsc3_route.h"
+#include <condition_variable>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -53,13 +55,17 @@ public:
     std::vector<RouteComponent> components() const;
 
     int readTs(uint8_t* buf, int size) { return remux_.read(buf, size); }   // blocks; the Reader of HlsPipeline
-    int readTsTimed(uint8_t* buf, int size, int timeoutMs) { return remux_.readTimed(buf, size, timeoutMs); }
-    void stop() { remux_.stop(); }
+    int readTsTimed(uint8_t* buf, int size, int timeoutMs);   // a stream of MPEG-2 TS in ALP (A/330 5.4) comes out here directly; otherwise the remuxed services
+    void stop() { { std::lock_guard<std::mutex> lk(tsMu_); stopped_ = true; } tsCv_.notify_all(); remux_.stop(); }
     Atsc3Remux& remux() { return remux_; }
     ReceiverStats stats() const;
     FrameInfo frameInfo() const;                              // the last frame that decoded
 
 private:
+    std::mutex tsMu_;
+    std::condition_variable tsCv_;
+    std::deque<uint8_t> tsDirect_;
+    bool sawTs_ = false, stopped_ = false;
     void onAlp(const AlpPacket& a);
     void onUdp(const UdpDatagram& d);
     void startRoute();

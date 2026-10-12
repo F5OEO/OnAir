@@ -1,3 +1,4 @@
+#include <chrono>
 #include "dect2/atsc3_receiver.h"
 #include "dect2/atsc3_bb.h"
 #include "atsc3_ldpc.h"
@@ -215,6 +216,27 @@ void Atsc3Receiver::onAlp(const AlpPacket& a) {
         else st_.alpOther++;
     }
     if (a.type == AlpIpv4) pushIp(a.data.data(), a.data.size());
+    else if (a.type == AlpTs) {
+        std::lock_guard<std::mutex> lk(tsMu_);
+        sawTs_ = true;
+        if (tsDirect_.size() < (size_t)64 << 20) tsDirect_.insert(tsDirect_.end(), a.data.begin(), a.data.end());
+        tsCv_.notify_all();
+    }
+}
+
+int Atsc3Receiver::readTsTimed(uint8_t* buf, int size, int timeoutMs) {
+    {
+        std::unique_lock<std::mutex> lk(tsMu_);
+        if (sawTs_) {
+            tsCv_.wait_for(lk, std::chrono::milliseconds(timeoutMs), [&] { return !tsDirect_.empty() || stopped_; });
+            if (stopped_ && tsDirect_.empty()) return -1;
+            const int n = (int)std::min<size_t>(tsDirect_.size() / 188 * 188, (size_t)size / 188 * 188);
+            std::copy(tsDirect_.begin(), tsDirect_.begin() + n, buf);
+            tsDirect_.erase(tsDirect_.begin(), tsDirect_.begin() + n);
+            return n;
+        }
+    }
+    return remux_.readTimed(buf, size, timeoutMs);
 }
 
 void Atsc3Receiver::pushIp(const uint8_t* p, size_t n) {

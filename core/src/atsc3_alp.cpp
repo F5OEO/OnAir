@@ -115,7 +115,8 @@ Hdr readHeader(const uint8_t* b, int n) {
         bool ahf = b[0] & 1;
         if (ahf && n < 2) return h;
         h.header = ahf ? 2 : 1;
-        h.payload = numts * 187;
+        const bool hdm = ahf && (b[1] & 0x80);                    // A/330 5.4.4: header deletion keeps the first TS header, the others lose their 3 header bytes
+        h.payload = hdm ? 187 + (numts - 1) * 184 : numts * 187;
         h.ok = true;
         return h;
     }
@@ -193,11 +194,23 @@ bool alpParse(const std::vector<uint8_t>& a, std::vector<AlpPacket>& out, bool* 
         if (numts == 0) numts = 16;
         AlpPacket p;
         p.type = AlpTs;
-        int deleted = (b[0] & 1) ? (b[1] & 0x7F) : 0;
-        (void)deleted;   // null packets are not re-inserted here; the count is available to callers that need constant bit rate
+        const bool hdm = (b[0] & 1) && (b[1] & 0x80);
+        // null packets (DNP) are not re-inserted here
+        const uint8_t* t = b + h.header;
+        if (n < h.header + h.payload) return false;
+        uint8_t h1 = 0, h2 = 0, h3 = 0;   // the first packet's header, repeated by the others when header deletion is on
         for (int i = 0; i < numts; i++) {
             p.data.push_back(0x47);
-            p.data.insert(p.data.end(), b + h.header + i * 187, b + h.header + (i + 1) * 187);
+            if (!hdm || i == 0) {
+                if (i == 0) { h1 = t[0]; h2 = t[1]; h3 = t[2]; }
+                p.data.insert(p.data.end(), t, t + 187);
+                t += 187;
+            } else {   // continuity counter counted on from the first packet
+                p.data.push_back(h1); p.data.push_back(h2);
+                p.data.push_back((uint8_t)((h3 & 0xF0) | ((h3 + i) & 0x0F)));
+                p.data.insert(p.data.end(), t, t + 184);
+                t += 184;
+            }
         }
         out.push_back(p);
         return true;
