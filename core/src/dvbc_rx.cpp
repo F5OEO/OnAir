@@ -22,13 +22,18 @@ namespace dect2 {
 
 namespace {
 constexpr double kPi = 3.14159265358979323846;
+#if defined(__GNUC__) && !defined(__clang__) && defined(__x86_64__) && defined(__linux__)
+#define DVBC_HOT __attribute__((target_clones("arch=haswell", "default")))   // the loops that set the CPU load: use AVX2 and FMA where the CPU has them
+#else
+#define DVBC_HOT
+#endif
 constexpr int kTaps = 28;                 // equaliser, half-symbol spacing: 20 symbols
 constexpr int kMain = kTaps - 1 - 8;      // the main tap: 4 symbols of pre-cursor
 constexpr int kPhases = 256;
 constexpr size_t kAcqN = 65536, kAcqBlocks = 4;
 constexpr uint64_t kCmaSyms = 400000, kDdSyms = 60000;
 constexpr size_t kSyncBlocks = 20;
-constexpr size_t kPhBlock = 256, kPhMargin = 16;   // phase smoothing: symbols per block, and the overlap on each side
+constexpr size_t kPhBlock = 1024, kPhMargin = 16;   // phase smoothing: symbols per block, and the overlap on each side
 constexpr int kPhHalf = 5;
 
 const std::vector<uint8_t>& prbsKeys() {
@@ -83,6 +88,7 @@ struct DvbcReceiver::Impl {
     size_t queued = 0;
     bool stop = false, busy = false, resetReq = false;
     std::atomic<uint64_t> dropped{0};
+    uint64_t droppedLogged = 0, droppedLogAt = 0;
 
     // telemetry
     std::mutex tmu;
@@ -106,6 +112,8 @@ struct DvbcReceiver::Impl {
     std::vector<cf32> hb;                  // mixed input history
     double tau = 0;                        // next output time, in hb samples
     double sps = 1.44;
+    const dvbc::Constellation* cnP = nullptr; int cnQam = -1;
+    const dvbc::Constellation& cn() { if (cnQam != qam) { cnP = &dvbc::constellation(qam); cnQam = qam; } return *cnP; }   // the constellation of the order in use, looked up once
     int K = 12;
     std::vector<float> taps;
     double tnu = 0;                        // timing loop: relative rate correction
@@ -115,7 +123,7 @@ struct DvbcReceiver::Impl {
     float lastTed = 0; double tedAvg = 0;
     // equaliser
     cf32 u[2 * kTaps];
-    int upos = 0;
+    int upos = 0, adaptTick = 0;
     cf32 w[kTaps], wCma[kTaps];
     uint64_t syms = 0, stageSyms = 0;
     double theta = 0, nu = 0;              // carrier loop (radians, radians per symbol)
@@ -144,6 +152,8 @@ struct DvbcReceiver::Impl {
     void log(const std::string& s) { if (logCb) logCb("DVB-C: " + s); }
 
     void hardReset() {
+        backStop(); lostFlag = false;
+        std::lock_guard<std::mutex> bl(bmu);
         stage = Acq; acq.clear(); hb.clear(); tau = 0; tnu = 0; strobe = true; agcP = 0; agcN = 0;
         syms = stageSyms = 0; zbuf.clear(); bits.clear(); after.clear(); out.clear(); failCycles = 0; usedManual = false; note.clear();
         rsClean = rsCorr = rsFail = packets = packetsBad = 0; cells.clear(); merHist.clear(); errP = 0;
@@ -294,10 +304,13 @@ struct DvbcReceiver::Impl {
     }
 
     // ---------------------------------------------------------------- per symbol
+    DVBC_HOT
     void onSymbol() {
         const cf32* win = &u[upos];
-        cf32 z(0, 0);
-        for (int j = 0; j < kTaps; j++) z += w[j] * win[j];
+        float zr_[2] = {0, 0}, zi_[2] = {0, 0};
+        for (int j = 0; j < kTaps; j += 2)
+            for (int q = 0; q < 2; q++) { zr_[q] += w[j + q].real() * win[j + q].real() - w[j + q].imag() * win[j + q].imag(); zi_[q] += w[j + q].real() * win[j + q].imag() + w[j + q].imag() * win[j + q].real(); }
+        const cf32 z(zr_[0] + zr_[1], zi_[0] + zi_[1]);
         syms++; stageSyms++;
         const float mu = stageSyms < 120000 ? 4e-4f : stageSyms < 250000 ? 1e-4f : 3e-5f;
         if (stage == Cma || stage == Freq) {
@@ -312,54 +325,162 @@ struct DvbcReceiver::Impl {
             return;
         }
         // decision directed
-        const cf32 rot((float)std::cos(theta), (float)-std::sin(theta));
+        const cf32 rot(std::cos((float)theta), -std::sin((float)theta));
         const cf32 zr = z * rot;
-        const dvbc::Constellation& c = dvbc::constellation(qam);
+        const dvbc::Constellation& c = cn();
         const int sym = c.decide(zr);
         const cf32 d = c.pts[(size_t)sym];
         const cf32 err = zr - d;
         const float mud = stage == Locked ? 1.5e-4f : 3e-4f;
         const cf32 eb = err * std::conj(rot);
-        for (int j = 0; j < kTaps; j++) w[j] -= mud * eb * std::conj(win[j]);
+        if (stage != Locked || (adaptTick ^= 1)) {   // locked: the equaliser has converged, so adapt every second symbol with twice the step
+            const cf32 step = (stage == Locked ? 2 * mud : mud) * eb;
+            for (int j = 0; j < kTaps; j++) w[j] -= step * std::conj(win[j]);
+        }
         const double ph = (double)(zr * std::conj(d)).imag() / (std::norm(d) + 1e-9);
         theta += nu + 0.01 * ph;
         nu += 1e-5 * ph;
         if (theta > kPi) theta -= 2 * kPi; else if (theta < -kPi) theta += 2 * kPi;
         phBuf.push_back(zr);
-        if (phBuf.size() >= kPhBlock + 2 * kPhMargin) smoothPhase();
+        if (phBuf.size() >= kPhBlock + 2 * kPhMargin) { if (stage == Locked) offload(); else smoothPhase(); }
     }
 
     // The loop above follows the carrier only as fast as its decisions allow; a HackRF's synthesiser leaves phase noise out to a few hundred kHz
     // (a bump near 100 kHz), which on 256-QAM costs 2 dB of MER. Here the phase of every symbol is measured again from its neighbours'
     // decisions (both sides, the symbol itself left out), a few times over, before the symbols are decided for the outer decoder.
-    std::vector<cf32> phBuf, phOut;
-    std::vector<cf32> phG;
-    void smoothPhase() {
-        const dvbc::Constellation& c = dvbc::constellation(qam);
-        const size_t n = phBuf.size();
-        phOut.assign(phBuf.begin(), phBuf.end());
-        phG.resize(n);
+    std::vector<cf32> phBuf;
+    struct Smooth { std::vector<cf32> phOut; std::vector<float> pR, pI, gR, gI, oR, oI; };
+    Smooth smM;   // the receiver thread's scratch; the outer-decoder thread has its own
+    DVBC_HOT
+    void smooth(Smooth& sm, const std::vector<cf32>& in, const dvbc::Constellation& c) {
+        auto& pR = sm.pR; auto& pI = sm.pI; auto& gR = sm.gR; auto& gI = sm.gI; auto& oR = sm.oR; auto& oI = sm.oI; auto& phOut = sm.phOut;
+        const size_t n = in.size();
+        // separate real / imaginary arrays: the FIR and the rotation below then vectorise
+        for (auto* v : {&pR, &pI, &gR, &gI, &oR, &oI}) v->resize(n);
+        float* __restrict PR = pR.data(); float* __restrict PI = pI.data();
+        float* __restrict GR = gR.data(); float* __restrict GI = gI.data();
+        float* __restrict OR = oR.data(); float* __restrict OI = oI.data();
+        for (size_t i = 0; i < n; i++) { PR[i] = OR[i] = in[i].real(); PI[i] = OI[i] = in[i].imag(); }
         static const float kw[kPhHalf] = {0.97f, 0.88f, 0.75f, 0.59f, 0.41f};   // a Hann window, the centre left out
+        const size_t H = kPhHalf;
         for (int it = 0; it < 3; it++) {
-            for (size_t i = 0; i < n; i++) { const cf32 d = c.pts[(size_t)c.decide(phOut[i])]; phG[i] = phBuf[i] * std::conj(d); }
-            for (size_t i = 0; i < n; i++) {
-                cf32 acc(0, 0);
-                for (int k = 1; k <= kPhHalf; k++) {
-                    if (i >= (size_t)k) acc += kw[k - 1] * phG[i - (size_t)k];
-                    if (i + (size_t)k < n) acc += kw[k - 1] * phG[i + (size_t)k];
-                }
-                const float a = std::abs(acc);
-                phOut[i] = a > 0 ? phBuf[i] * std::conj(acc) / a : phBuf[i];
+            for (size_t i = 0; i < n; i++) { const cf32 d = c.pts[(size_t)c.decide(cf32(OR[i], OI[i]))]; GR[i] = PR[i] * d.real() + PI[i] * d.imag(); GI[i] = PI[i] * d.real() - PR[i] * d.imag(); }
+            auto rotate = [&](size_t i, float ar, float ai) {
+                const float a2 = ar * ar + ai * ai;
+                const float g = a2 > 0 ? 1.f / std::sqrt(a2) : 0.f;
+                OR[i] = a2 > 0 ? (PR[i] * ar + PI[i] * ai) * g : PR[i];
+                OI[i] = a2 > 0 ? (PI[i] * ar - PR[i] * ai) * g : PI[i];
+            };
+            for (size_t i = 0; i < n && i < H; i++) {   // the edges, with bounds checks
+                float ar = 0, ai = 0;
+                for (size_t k = 1; k <= H; k++) { if (i >= k) { ar += kw[k - 1] * GR[i - k]; ai += kw[k - 1] * GI[i - k]; } if (i + k < n) { ar += kw[k - 1] * GR[i + k]; ai += kw[k - 1] * GI[i + k]; } }
+                rotate(i, ar, ai);
+            }
+            for (size_t i = n > H ? std::max(H, n - H) : n; i < n; i++) {
+                float ar = 0, ai = 0;
+                for (size_t k = 1; k <= H; k++) { if (i >= k) { ar += kw[k - 1] * GR[i - k]; ai += kw[k - 1] * GI[i - k]; } if (i + k < n) { ar += kw[k - 1] * GR[i + k]; ai += kw[k - 1] * GI[i + k]; } }
+                rotate(i, ar, ai);
+            }
+            for (size_t i = H; i + H < n; i++) {   // the middle: no bounds checks
+                float ar = 0, ai = 0;
+                for (size_t k = 1; k <= H; k++) { ar += kw[k - 1] * (GR[i - k] + GR[i + k]); ai += kw[k - 1] * (GI[i - k] + GI[i + k]); }
+                rotate(i, ar, ai);
             }
         }
-        for (size_t i = kPhMargin; i < kPhMargin + kPhBlock; i++) decided(phOut[i]);
+        phOut.resize(n);
+        for (size_t i = 0; i < n; i++) phOut[i] = cf32(OR[i], OI[i]);
+    }
+
+    void smoothPhase() {
+        smooth(smM, phBuf, cn());
+        for (size_t i = kPhMargin; i < kPhMargin + kPhBlock; i++) decided(smM.phOut[i]);
         if (stage == Acq || phBuf.empty()) return;   // decided() may have restarted the trial
         phBuf.erase(phBuf.begin(), phBuf.begin() + (std::ptrdiff_t)kPhBlock);
     }
 
+    // ---------------------------------------------------------------- second thread: smoothing, decisions and the outer decoder once locked
+    // The receiver thread (equaliser, carrier and timing loops) hands blocks of equalised symbols over; this thread smooths their phase, decides
+    // them and runs the Reed-Solomon decoder. It owns bits, after, deint, the counters, errP / sigP and the constellation cells while locked;
+    // the receiver thread touches those only after backStop(), or with bmu held (publish).
+    struct Job { std::vector<cf32> blk; const dvbc::Constellation* c; double blockSecs; uint64_t gen; };   // blockSecs: the time the block's symbols span
+    std::thread bth;
+    std::mutex jmu, bmu;
+    std::condition_variable jcv, jidle;
+    std::deque<Job> jobs;
+    bool bstop = false, bbusy = false;
+    std::atomic<uint64_t> gen{0};
+    std::atomic<bool> lostFlag{false};
+    Smooth smB;
+    double pendSecs = 0;   // stream time handed over since the last packet callback: the callback is told how long the packets span, not when they are
+
+    void offload() {
+        Job j{phBuf, &cn(), (double)kPhBlock * (1 + tnu) / rs, gen.load()};
+        phBuf.erase(phBuf.begin(), phBuf.begin() + (std::ptrdiff_t)kPhBlock);
+        std::unique_lock<std::mutex> lk(jmu);
+        jcv.wait(lk, [&] { return jobs.size() < 48 || bstop; });   // the outer thread is far lighter than this one: this never waits for long
+        jobs.push_back(std::move(j));
+        jcv.notify_all();
+    }
+    void backStop() {   // drop what is queued, wait for the job in flight: afterwards the receiver thread owns everything again
+        std::unique_lock<std::mutex> lk(jmu);
+        jobs.clear(); gen++;
+        jcv.notify_all();
+        jidle.wait(lk, [&] { return !bbusy; });
+    }
+    void backIdle() {
+        std::unique_lock<std::mutex> lk(jmu);
+        jidle.wait(lk, [&] { return (jobs.empty() && !bbusy) || bstop; });
+    }
+    void lockedDecided(cf32 zr, const dvbc::Constellation& c) {
+        const int sym = c.decide(zr);
+        const cf32 d = c.pts[(size_t)sym];
+        errP = 0.999 * errP + 0.001 * std::norm(zr - d);
+        sigP = 0.999 * sigP + 0.001 * std::norm(d);
+        if (cells.size() < 2048) cells.push_back(zr); else { cells[cellPos] = zr; cellPos = (cellPos + 1) % 2048; }
+        dm[0].push(inv ? c.decide(std::conj(zr)) : sym, bits);
+    }
+    void backRun() {
+        for (;;) {
+            Job j;
+            {
+                std::unique_lock<std::mutex> lk(jmu);
+                jcv.wait(lk, [&] { return bstop || !jobs.empty(); });
+                if (bstop) return;
+                j = std::move(jobs.front()); jobs.pop_front();
+                bbusy = true;
+                jcv.notify_all();
+            }
+            if (j.gen == gen.load()) {
+                std::vector<uint8_t> pk;
+                {
+                    std::lock_guard<std::mutex> bl(bmu);
+                    smooth(smB, j.blk, *j.c);
+                    for (size_t i = kPhMargin; i < kPhMargin + kPhBlock; i++) lockedDecided(smB.phOut[i], *j.c);
+                    outer();
+                    pk.swap(out);
+                }
+                pendSecs += j.blockSecs;
+                if (!pk.empty() && pktCb) { const double dt = pendSecs; pendSecs = 0; pktCb(pk.data(), pk.size() / 188, dt); }
+            }
+            {
+                std::lock_guard<std::mutex> lk(jmu);
+                bbusy = false;
+                jidle.notify_all();
+            }
+        }
+    }
+    void handleLost() {
+        backStop();
+        log("lost the stream, searching again");
+        reacq++;
+        { std::lock_guard<std::mutex> bl(bmu); bits.clear(); after.clear(); haveGroup = false; }
+        lostFlag = false; pendSecs = 0;
+        stage = Cma; stageSyms = 0; phBuf.clear();
+    }
+
     void decided(cf32 zr) {
         if (phBuf.empty()) return;   // a stage change dropped the block
-        const dvbc::Constellation& c = dvbc::constellation(qam);
+        const dvbc::Constellation& c = cn();
         const int sym = c.decide(zr);
         const cf32 d = c.pts[(size_t)sym];
         errP = 0.999 * errP + 0.001 * std::norm(zr - d);
@@ -440,7 +561,7 @@ struct DvbcReceiver::Impl {
             dm[0] = dm[v];
             deint = dvbt::ConvInterleaver(true);
             warm = 12; haveGroup = false; after.clear(); consecBad = 0;
-            stage = Locked; lockedAt = processed; failCycles = 0;
+            stage = Locked; lockedAt = processed; failCycles = 0; pendSecs = 0;
             char m[160];
             snprintf(m, sizeof m, "%s locked%s, %.4f Msym/s, MER %.1f dB", dvbc::qamName(qam), inv ? " (spectrum inverted)" : "", rs / (1 + tnu) / 1e6, mer());
             log(m);
@@ -487,10 +608,8 @@ struct DvbcReceiver::Impl {
                 out.insert(out.end(), pkt, pkt + 188);
             }
             if (consecBad >= 48) {
-                log("lost the stream, searching again");
-                reacq++;
+                lostFlag = true;   // the receiver thread restarts the search
                 bits.clear(); after.clear(); haveGroup = false;
-                stage = Cma; stageSyms = 0; phBuf.clear();
                 return;
             }
         }
@@ -499,6 +618,7 @@ struct DvbcReceiver::Impl {
     }
 
     // ---------------------------------------------------------------- input
+    DVBC_HOT
     void process(const cf32* x, size_t n) {
         size_t i = 0;
         while (i < n) {
@@ -509,16 +629,22 @@ struct DvbcReceiver::Impl {
                 if (acq.size() == kAcqN * kAcqBlocks) { analyse(); acq.clear(); }
                 continue;
             }
+            if (lostFlag.load() && stage == Locked) handleLost();
             // mix and filter a chunk
             const size_t take = std::min<size_t>(n - i, 16384);
+            // the mixer is a rotating phasor (renormalised every 256 samples), not a sin/cos per sample
+            double pr = std::cos(ncoPh), pi_ = std::sin(ncoPh);
+            const double sr = std::cos(ncoStep), si = std::sin(ncoStep);
             for (size_t k = 0; k < take; k++) {
                 const std::complex<double> xi(x[i + k].real(), x[i + k].imag());
                 dcI += dcA * (xi - dcI);
                 const std::complex<double> xd = xi - dcI;
-                hb.push_back(cf32((float)xd.real(), (float)xd.imag()) * cf32((float)std::cos(ncoPh), (float)std::sin(ncoPh)));
-                ncoPh += ncoStep;
-                if (ncoPh > kPi) ncoPh -= 2 * kPi; else if (ncoPh < -kPi) ncoPh += 2 * kPi;
+                hb.push_back(cf32((float)xd.real(), (float)xd.imag()) * cf32((float)pr, (float)pi_));
+                const double nr = pr * sr - pi_ * si;
+                pi_ = pr * si + pi_ * sr; pr = nr;
+                if ((k & 255) == 255) { const double g = 1.0 / std::sqrt(pr * pr + pi_ * pi_); pr *= g; pi_ *= g; }
             }
+            ncoPh = std::atan2(pi_, pr);
             i += take; processed += take;
             const int L = 2 * K;
             while (stage != Acq && tau + K + 1 < (double)hb.size()) {
@@ -526,9 +652,12 @@ struct DvbcReceiver::Impl {
                 const int p = std::min(kPhases - 1, (int)((tau - fl) * kPhases));
                 const float* h = &taps[(size_t)p * (size_t)L];
                 const cf32* s = &hb[(size_t)fl - (size_t)K + 1];
-                float re = 0, im = 0;
-                for (int j = 0; j < L; j++) { re += h[j] * s[j].real(); im += h[j] * s[j].imag(); }
-                cf32 y(re, im);
+                float re[4] = {0, 0, 0, 0}, im[4] = {0, 0, 0, 0};   // independent sums: no dependency chain, so the loop vectorises
+                int j = 0;
+                for (; j + 4 <= L; j += 4)
+                    for (int q = 0; q < 4; q++) { re[q] += h[j + q] * s[j + q].real(); im[q] += h[j + q] * s[j + q].imag(); }
+                for (; j < L; j++) { re[0] += h[j] * s[j].real(); im[0] += h[j] * s[j].imag(); }
+                cf32 y((re[0] + re[1]) + (re[2] + re[3]), (im[0] + im[1]) + (im[2] + im[3]));
                 const double pw = std::norm(y);
                 agcN++;
                 agcP = agcN < 1000 ? agcP + (pw - agcP) / (double)agcN : agcP + 2e-5 * (pw - agcP);
@@ -553,14 +682,12 @@ struct DvbcReceiver::Impl {
             if (stage == Acq) { hb.clear(); continue; }
             const size_t drop = (size_t)std::max(0.0, std::floor(tau) - K - 4);
             if (drop > 32768) { hb.erase(hb.begin(), hb.begin() + (std::ptrdiff_t)drop); tau -= (double)drop; }
-            if (stage == Locked) outer();
-            if (!out.empty() && pktCb) pktCb(out.data(), out.size() / 188, (double)processed / fs);
-            out.clear();
         }
         if (processed >= nextTel) { nextTel = processed + (uint64_t)(fs / 4); publish(); }
     }
 
     void publish() {
+        std::lock_guard<std::mutex> bl(bmu);   // the outer-decoder thread's counters and cells
         DvbcTelemetry t;
         t.state = stage == Locked ? 2 : stage == Acq ? 0 : 1;
         const double rsNow = rs / (1 + tnu);
@@ -621,16 +748,24 @@ struct DvbcReceiver::Impl {
                 busy = true;
                 qcv.notify_all();
             }
+            const uint64_t d = dropped.load();
+            if (d != droppedLogged && processed - droppedLogAt >= (uint64_t)fs) {   // at most once per second of signal
+                char m[120]; snprintf(m, sizeof m, "the receiver is too slow for the sample rate: %.0f ms of signal dropped", (double)(d - droppedLogged) / fs * 1e3);
+                droppedLogged = d; droppedLogAt = processed; log(m);
+            }
             process(v.data(), v.size());
         }
     }
 };
 
-DvbcReceiver::DvbcReceiver() : p_(new Impl) { p_->th = std::thread([this] { p_->run(); }); }
+DvbcReceiver::DvbcReceiver() : p_(new Impl) { p_->bth = std::thread([this] { p_->backRun(); }); p_->th = std::thread([this] { p_->run(); }); }
 DvbcReceiver::~DvbcReceiver() {
     { std::lock_guard<std::mutex> lk(p_->qmu); p_->stop = true; }
     p_->qcv.notify_all();
     if (p_->th.joinable()) p_->th.join();
+    { std::lock_guard<std::mutex> lk(p_->jmu); p_->bstop = true; }
+    p_->jcv.notify_all(); p_->jidle.notify_all();
+    if (p_->bth.joinable()) p_->bth.join();
 }
 void DvbcReceiver::configure(double fs) { flush(); p_->fs = fs > 0 ? fs : 10e6; reset(); flush(); }
 bool DvbcReceiver::ready() const { return p_->fs >= 7e6; }
@@ -648,6 +783,8 @@ void DvbcReceiver::feed(const cf32* x, size_t n) {
 void DvbcReceiver::flush() {
     std::unique_lock<std::mutex> lk(p_->qmu);
     p_->idleCv.wait(lk, [&] { return (p_->q.empty() && !p_->busy && !p_->resetReq) || p_->stop; });
+    lk.unlock();
+    p_->backIdle();   // the outer-decoder thread has delivered everything handed to it
 }
 bool DvbcReceiver::telemetry(DvbcTelemetry& out, uint64_t lastSeq) {
     std::lock_guard<std::mutex> lk(p_->tmu);
