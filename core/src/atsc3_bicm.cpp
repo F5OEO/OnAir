@@ -2,6 +2,7 @@
 #include "atsc3_data_tables.h"
 #include "atsc3_ldpc.h"
 #include "dect2/atsc3_l1.h"
+#include "dect2/simd.h"
 #include "dect2/t2fec.h"
 #include <algorithm>
 #include <cmath>
@@ -66,6 +67,35 @@ std::vector<int> parityMap(const Ldpc& c) {   // u(K + 360 t + s) = lambda(K + Q
         for (int s = 0; s < 360; s++)
             for (int t = 0; t < Q; t++) m[c.k() + 360 * t + s] = c.k() + Q * s + t;
     return m;
+}
+
+
+// Max-log LLRs of the cells of a block for constellations up to 256 points: the squared distance to every point, then the nearest point with
+// the bit at 0 and at 1 for each bit. Written so that the compiler vectorises the distance and the minimum loops.
+DECT2_MULTIVERSION void llrCells(const float* pr, const float* pi, int eta, const cf32* cells, int nc, float invNv, const int* perm, float* llr) {
+    const int M = 1 << eta;
+    float d[256];
+    for (int s = 0; s < nc; s++) {
+        const float cr = cells[s].real(), ci = cells[s].imag();
+        for (int m = 0; m < M; m++) { const float a = cr - pr[m], b = ci - pi[m]; d[m] = a * a + b * b; }
+        for (int k = 0; k < eta; k++) {
+            const int blk = M >> (k + 1);   // labels with bit k at 0 and at 1 alternate in runs of this length
+            float m0 = 1e30f, m1 = 1e30f;
+            if (blk >= 8) {
+                float v0[8], v1[8];
+                for (int j = 0; j < 8; j++) v0[j] = v1[j] = 1e30f;
+                for (int base = 0; base < M; base += 2 * blk) {
+                    for (int i = 0; i < blk; i += 8)
+                        for (int j = 0; j < 8; j++) { v0[j] = std::min(v0[j], d[base + i + j]); v1[j] = std::min(v1[j], d[base + blk + i + j]); }
+                }
+                for (int j = 0; j < 8; j++) { m0 = std::min(m0, v0[j]); m1 = std::min(m1, v1[j]); }
+            } else {
+                for (int base = 0; base < M; base += 2 * blk)
+                    for (int i = 0; i < blk; i++) { m0 = std::min(m0, d[base + i]); m1 = std::min(m1, d[base + blk + i]); }
+            }
+            llr[perm[s * eta + k]] = (m1 - m0) * invNv;
+        }
+    }
 }
 
 } // namespace
@@ -155,17 +185,9 @@ bool Bicm::decode(const cf32* cells, float noiseVar, std::vector<uint8_t>& paylo
     const float nv = std::max(noiseVar, 1e-5f);
     std::vector<float> llr(cfg_.nInner, 0.f);
     if (eta <= 8) {
-        for (int s = 0; s < nc; s++) {
-            float best0[8], best1[8];
-            for (int k = 0; k < eta; k++) best0[k] = best1[k] = 1e30f;
-            for (int lab = 0; lab < M; lab++) {
-                float d = std::norm(cells[s] - points_[lab]);
-                for (int k = 0; k < eta; k++) {
-                    if ((lab >> (eta - 1 - k)) & 1) best1[k] = std::min(best1[k], d); else best0[k] = std::min(best0[k], d);
-                }
-            }
-            for (int k = 0; k < eta; k++) llr[perm_[s * eta + k]] = (best1[k] - best0[k]) / nv;
-        }
+        std::vector<float> pr((size_t)M), pi((size_t)M);
+        for (int m = 0; m < M; m++) { pr[(size_t)m] = points_[(size_t)m].real(); pi[(size_t)m] = points_[(size_t)m].imag(); }
+        llrCells(pr.data(), pi.data(), eta, cells, nc, 1.f / nv, perm_.data(), llr.data());
     } else {
         // separable: one dimension at a time over the 2^(eta/2) levels of that dimension
         const int half = eta / 2, L = 1 << half;
