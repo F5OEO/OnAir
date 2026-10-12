@@ -1,5 +1,6 @@
 #include "dect2/atsc3_receiver.h"
 #include "dect2/atsc3_bb.h"
+#include "atsc3_ldpc.h"
 #include "dect2/atsc3_ti.h"
 #include <algorithm>
 #include <atomic>
@@ -75,14 +76,26 @@ PlpResult Atsc3Receiver::runCti(const PlpResult& in) {
         c->buf.erase(c->buf.begin(), c->buf.begin() + drop);
         c->outPos += (long)drop;
     }
-    // the blocks are independent: decode them on a few threads
+    // the blocks are independent: they go to the decoder in batches (one block per vector lane), the batches on a few threads
     const size_t n = blocks.size();
     std::vector<std::vector<uint8_t>> bits(n);
     std::vector<char> ok(n, 0);
     const Bicm& bicm = *c->bicm;
-    auto work = [&](std::atomic<size_t>& next) { for (size_t k; (k = next++) < n;) ok[k] = bicm.decode(blocks[k].data(), in.noise, bits[k]) ? 1 : 0; };
+    const float in_noise = in.noise;
+    const size_t bs = (size_t)Ldpc::kBatch, nBatches = (n + bs - 1) / bs;
+    auto work = [&](std::atomic<size_t>& next) {
+        for (size_t k; (k = next++) < nBatches;) {
+            const size_t from = k * bs, to = std::min(n, from + bs);
+            std::vector<const cf32*> in;
+            for (size_t i = from; i < to; i++) in.push_back(blocks[i].data());
+            std::vector<std::vector<uint8_t>> pl;
+            std::vector<char> good;
+            bicm.decodeBatch(in, in_noise, pl, good);
+            for (size_t i = from; i < to; i++) { ok[i] = good[i - from]; bits[i].swap(pl[i - from]); }
+        }
+    };
     std::atomic<size_t> next{0};
-    const size_t nt = std::min<size_t>(n, (size_t)std::max(1, std::min(8, (int)std::thread::hardware_concurrency())));
+    const size_t nt = std::min<size_t>(nBatches, (size_t)std::max(1, std::min(8, (int)std::thread::hardware_concurrency())));
     std::vector<std::thread> th;
     for (size_t t = 1; t < nt; t++) th.emplace_back(work, std::ref(next));
     work(next);

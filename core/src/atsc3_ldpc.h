@@ -25,6 +25,11 @@ public:
     // Normalised min-sum decoding; llr > 0 means bit 0. Returns true when every parity check is satisfied.
     bool decode(const std::vector<float>& llr, int maxIter, std::vector<uint8_t>& hard, int* iters = nullptr) const;
 
+    // Layered offset min-sum on saturating 8-bit values for up to kBatch blocks at once (the lanes of a vector). `llr[b]` are the blocks' LLRs
+    // (llr > 0 means bit 0), already scaled to the 8-bit range (+-31). Fills hard[b] and ok[b] (every check satisfied) for each block.
+    static constexpr int kBatch = 16;
+    void decodeBatch(const std::vector<const int8_t*>& llr, int maxIter, std::vector<std::vector<uint8_t>>& hard, std::vector<char>& ok) const;
+
 private:
     int rate_, n_ = 16200, k_ = 0, m_ = 0;
     bool typeA_ = false;

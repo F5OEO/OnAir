@@ -1,4 +1,5 @@
 #include "atsc3_ldpc.h"
+#include "dect2/simd.h"
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -140,6 +141,89 @@ bool Ldpc::decode(const std::vector<float>& llr, int maxIter, std::vector<uint8_
     }
     if (iters) *iters = maxIter;
     return false;
+}
+
+
+// ---- layered decoder on 8-bit values, one block per vector lane
+
+namespace {
+
+constexpr int L = Ldpc::kBatch;
+typedef int8_t V __attribute__((vector_size(16)));   // GCC / Clang vector: SSE on x86-64, NEON on ARM
+static_assert(L == 16, "one block per byte of a 16 byte vector");
+
+inline V vsel(V mask, V a, V b) { return (mask & a) | (~mask & b); }
+inline V vabsv(V x) { const V s = x >> 7; return (x ^ s) - s; }
+// both clamps keep values in +-96 so that adding a message (+-31) never wraps
+inline V vclamp(V x, int8_t lim) { const V hi = {lim, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim}; const V lo = -hi; x = vsel(x > hi, hi, x); return vsel(x < lo, lo, x); }
+
+// One iteration over all checks. tot: values of the variables, msg: the messages of the edges.
+DECT2_MULTIVERSION void layeredPass(const int* chkStart, const int* chkVar, int m, V* tot, V* msg) {
+    V v[64];
+    const V one = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, big = {127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127}, zero = {};
+    for (int c = 0; c < m; c++) {
+        const int s = chkStart[c], d = chkStart[c + 1] - s;
+        V min1 = big, min2 = big, sg = zero;
+        for (int j = 0; j < d; j++) {
+            const V x = vclamp(tot[chkVar[s + j]] - msg[s + j], 96);
+            v[j] = x;
+            const V a = vabsv(x);
+            const V lt = a < min1;
+            min2 = vsel(lt, min1, vsel(a < min2, a, min2));
+            min1 = vsel(lt, a, min1);
+            sg ^= (x >> 7);
+        }
+        const V m1 = vsel(min1 > one, min1 - one, zero), m2 = vsel(min2 > one, min2 - one, zero);   // offset min-sum
+        for (int j = 0; j < d; j++) {
+            const V x = v[j];
+            const V a = vabsv(x);
+            V mag = vsel(a == min1, m2, m1);
+            const V c31 = {31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31};
+            mag = vsel(mag > c31, c31, mag);
+            const V neg = sg ^ (x >> 7);   // -1 where the message is negative
+            const V out = (mag ^ neg) - neg;
+            tot[chkVar[s + j]] = vclamp(x + out, 96);
+            msg[s + j] = out;
+        }
+    }
+}
+
+// lanes with a check that fails: bad[l] != 0
+DECT2_MULTIVERSION V syndromes(const int* chkStart, const int* chkVar, int m, const V* tot) {
+    V bad = {};
+    for (int c = 0; c < m; c++) {
+        V x = {};
+        for (int j = chkStart[c]; j < chkStart[c + 1]; j++) x ^= (tot[chkVar[j]] >> 7);
+        bad |= x;
+    }
+    return bad;
+}
+
+} // namespace
+
+void Ldpc::decodeBatch(const std::vector<const int8_t*>& llr, int maxIter, std::vector<std::vector<uint8_t>>& hard, std::vector<char>& ok) const {
+    const int nb = (int)llr.size();
+    hard.assign((size_t)nb, std::vector<uint8_t>());
+    ok.assign((size_t)nb, 0);
+    if (nb == 0 || nb > L) return;
+    for (size_t c = 0; c + 1 < chkStart_.size(); c++) if (chkStart_[c + 1] - chkStart_[c] > 64) return;
+    const V init = {31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31};   // unused lanes: the all-zero code word, satisfied from the start
+    std::vector<V> tot((size_t)n_, init), msg(chkVar_.size(), V{});
+    for (int b = 0; b < nb; b++)
+        for (int i = 0; i < n_; i++) tot[(size_t)i][b] = llr[(size_t)b][i];
+    V bad = {};
+    for (int it = 0; it < maxIter; it++) {
+        layeredPass(chkStart_.data(), chkVar_.data(), m_, tot.data(), msg.data());
+        bad = syndromes(chkStart_.data(), chkVar_.data(), m_, tot.data());
+        bool all = true;
+        for (int b = 0; b < nb; b++) if (bad[b]) all = false;
+        if (all) break;
+    }
+    for (int b = 0; b < nb; b++) {
+        ok[(size_t)b] = !bad[b];
+        hard[(size_t)b].resize((size_t)n_);
+        for (int i = 0; i < n_; i++) hard[(size_t)b][(size_t)i] = tot[(size_t)i][b] < 0;
+    }
 }
 
 const Ldpc& ldpcCode(int n, int rate15) {

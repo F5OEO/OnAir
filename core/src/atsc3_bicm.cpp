@@ -179,11 +179,10 @@ std::vector<cf32> Bicm::encode(const std::vector<uint8_t>& payload) const {
     return out;
 }
 
-bool Bicm::decode(const cf32* cells, float noiseVar, std::vector<uint8_t>& payload, int* iters) const {
-    if (!ok_) return false;
+void Bicm::llrs(const cf32* cells, float noiseVar, std::vector<float>& llr) const {
     const int eta = cfg_.bitsPerCell, nc = this->cells(), M = 1 << eta;
     const float nv = std::max(noiseVar, 1e-5f);
-    std::vector<float> llr(cfg_.nInner, 0.f);
+    llr.assign((size_t)cfg_.nInner, 0.f);
     if (eta <= 8) {
         std::vector<float> pr((size_t)M), pi((size_t)M);
         for (int m = 0; m < M; m++) { pr[(size_t)m] = points_[(size_t)m].real(); pi[(size_t)m] = points_[(size_t)m].imag(); }
@@ -226,8 +225,9 @@ bool Bicm::decode(const cf32* cells, float noiseVar, std::vector<uint8_t>& paylo
     // a few confidently wrong values (a cell the equaliser got wrong, noise the estimate left out) are as strong as many right ones for the min-sum
     // decoder and keep it from converging although the rest is clean: no value counts for more than this
     for (auto& v : llr) v = std::max(-kLlrLimit, std::min(kLlrLimit, v));
-    std::vector<uint8_t> hard;
-    if (!ldpcCode(cfg_.nInner, cfg_.rate15).decode(llr, 60, hard, iters)) return false;
+}
+
+bool Bicm::finish(const std::vector<uint8_t>& hard, std::vector<uint8_t>& payload) const {
     std::vector<uint8_t> bits(hard.begin(), hard.begin() + kLdpc_);
     if (cfg_.outer == 0) {
         const BchCode bch(cfg_.nInner == 16200, 12);
@@ -241,6 +241,44 @@ bool Bicm::decode(const cf32* cells, float noiseVar, std::vector<uint8_t>& paylo
     }
     payload.swap(bits);
     return true;
+}
+
+bool Bicm::decode(const cf32* cells, float noiseVar, std::vector<uint8_t>& payload, int* iters) const {
+    if (!ok_) return false;
+    std::vector<float> llr;
+    llrs(cells, noiseVar, llr);
+    std::vector<uint8_t> hard;
+    if (!ldpcCode(cfg_.nInner, cfg_.rate15).decode(llr, 60, hard, iters)) return false;
+    return finish(hard, payload);
+}
+
+void Bicm::decodeBatch(const std::vector<const cf32*>& cells, float noiseVar, std::vector<std::vector<uint8_t>>& payload, std::vector<char>& ok) const {
+    const int nb = (int)cells.size();
+    payload.assign((size_t)nb, std::vector<uint8_t>());
+    ok.assign((size_t)nb, 0);
+    if (!ok_ || nb == 0 || nb > Ldpc::kBatch) return;
+    std::vector<std::vector<int8_t>> q((size_t)nb);
+    std::vector<const int8_t*> ptr((size_t)nb);
+    std::vector<float> llr;
+    for (int b = 0; b < nb; b++) {
+        llrs(cells[(size_t)b], noiseVar, llr);
+        q[(size_t)b].resize(llr.size());
+        for (size_t i = 0; i < llr.size(); i++) q[(size_t)b][i] = (int8_t)std::lround(llr[i]);
+        ptr[(size_t)b] = q[(size_t)b].data();
+    }
+    std::vector<std::vector<uint8_t>> hard;
+    std::vector<char> good;
+    const Ldpc& code = ldpcCode(cfg_.nInner, cfg_.rate15);
+    // the values are the limited LLRs rounded to integers (+-20): with the 8-bit range filled to +-31 the decoder failed on 1.5% of the blocks, which
+    // the float decoder then had to take over
+    code.decodeBatch(ptr, 20, hard, good);
+    for (int b = 0; b < nb; b++) {
+        if (!good[(size_t)b]) {   // the 8-bit decoder gave up: the float one has the whole 60 iterations
+            llrs(cells[(size_t)b], noiseVar, llr);
+            good[(size_t)b] = code.decode(llr, 60, hard[(size_t)b]);
+        }
+        ok[(size_t)b] = good[(size_t)b] && finish(hard[(size_t)b], payload[(size_t)b]);
+    }
 }
 
 } // namespace atsc3

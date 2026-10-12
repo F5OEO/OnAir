@@ -26,6 +26,9 @@ public:
     std::vector<cf32> encode(const std::vector<uint8_t>& payload) const;
     // `noiseVar`: noise power per cell (both dimensions). Returns true if LDPC converged and the outer code (BCH correction or CRC) agrees.
     bool decode(const cf32* cells, float noiseVar, std::vector<uint8_t>& payload, int* ldpcIterations = nullptr) const;
+    // Up to 16 blocks at once with the 8-bit layered decoder (one block per vector lane): much faster per block than decode() when several blocks
+    // are waiting. payload[b] and ok[b] as for decode().
+    void decodeBatch(const std::vector<const cf32*>& cells, float noiseVar, std::vector<std::vector<uint8_t>>& payload, std::vector<char>& ok) const;
 
     // the constellation, indexed by the label (y0 most significant)
     const std::vector<cf32>& constellation() const { return points_; }
@@ -33,6 +36,8 @@ public:
     const std::vector<int>& bitPermutation() const { return perm_; }
 
 private:
+    void llrs(const cf32* cells, float noiseVar, std::vector<float>& llr) const;   // soft bits of the code word, limited
+    bool finish(const std::vector<uint8_t>& hard, std::vector<uint8_t>& payload) const;   // outer code on the decoded word
     BicmConfig cfg_;
     bool ok_ = false;
     int kPayload_ = 0, kLdpc_ = 0;
