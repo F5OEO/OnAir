@@ -1,4 +1,5 @@
 #include "dect2/atsc3_l1.h"
+#include "dect2/atsc3_bb.h"
 #include "atsc3_constellations.h"
 #include "atsc3_ldpc.h"
 #include "dect2/t2fec.h"
@@ -22,21 +23,8 @@ struct BitReader {
     int get(int n) { int v = 0; for (int i = 0; i < n; i++) v = (v << 1) | b[pos++]; return v; }
 };
 
-// ---- scrambler of A/322 5.2.3: x^16 + x^13 + x^12 + x^11 + x^7 + x^6 + x^3 + x + 1, initial state 0xF180.
-// NOTE: the standard's text gives the first output values, but the bit order of the register could not be confirmed against a real
-// transmitter; this is the straightforward serial reading (output taken from the last stage).
-std::vector<uint8_t> scramblerBits(int n) {
-    std::vector<uint8_t> out(n);
-    int r[16];   // r[0] = X1 ... r[15] = X16
-    for (int i = 0; i < 16; i++) r[i] = (0xF180 >> (15 - i)) & 1;
-    for (int i = 0; i < n; i++) {
-        out[i] = r[15];
-        int fb = r[15] ^ r[12] ^ r[11] ^ r[10] ^ r[6] ^ r[5] ^ r[2] ^ r[0];
-        for (int j = 15; j > 0; j--) r[j] = r[j - 1];
-        r[0] = fb;
-    }
-    return out;
-}
+// ---- scrambler of A/322 5.2.3 (the baseband packet scrambler)
+std::vector<uint8_t> scramblerBits(int n) { return bbScrambleSequence(n); }
 
 // ---- the protection chain, common to L1-Basic and L1-Detail (A/322 6.5.2)
 struct Prot {
@@ -149,7 +137,7 @@ std::vector<cf32> encodeBlock(const Prot& p, std::vector<uint8_t> bits) {
     std::vector<cf32> cells(z.rows);
     for (int i = 0; i < z.rows; i++) {
         int label = 0;
-        for (int j = 0; j < p.eta; j++) label = (label << 1) | word[((i + j) % p.eta) * z.rows + i];   // y_j = b_{(i+j) mod eta}(i)
+        for (int j = 0; j < p.eta; j++) label = (label << 1) | word[((p.eta == 2 ? j : (i + j) % p.eta)) * z.rows + i];   // y_j = b_{(i+j) mod eta}(i); QPSK is mapped as read (A/322 6.5.2.10)
         cells[i] = cons[label];
     }
     return cells;
@@ -171,7 +159,7 @@ bool decodeBlock(const Prot& p, const cf32* cells, float noiseVar, int ksig, std
                 if ((lab >> (p.eta - 1 - j)) & 1) best1[j] = std::min(best1[j], d); else best0[j] = std::min(best0[j], d);
             }
         }
-        for (int j = 0; j < p.eta; j++) word[((i + j) % p.eta) * z.rows + i] = (best1[j] - best0[j]) / nv;
+        for (int j = 0; j < p.eta; j++) word[((p.eta == 2 ? j : (i + j) % p.eta)) * z.rows + i] = (best1[j] - best0[j]) / nv;
     }
     auto pos = infoPositions(p, z.nouter);
     std::vector<float> llr(16200, 0.f);

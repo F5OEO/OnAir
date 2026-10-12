@@ -94,16 +94,20 @@ std::vector<uint8_t> makeBbPacket(int bytes, const std::vector<uint8_t>& payload
     return out;
 }
 
-std::vector<uint8_t> bbScrambleSequence(int n, int variant) {
-    std::vector<uint8_t> out(n);
-    // x^16 + x^13 + x^12 + x^11 + x^7 + x^6 + x^3 + x + 1, initial state 0xF180
-    int r[16];
-    for (int i = 0; i < 16; i++) r[i] = (0xF180 >> (15 - i)) & 1;
+std::vector<uint8_t> bbScrambleSequence(int n, int) {
+    // A/322 Figure 5.6: a 16 stage register of the Galois kind, G(x) = 1 + X + X^3 + X^6 + X^7 + X^11 + X^12 + X^13 + X^16, loaded with 0xF180
+    // (X1 .. X16 = 0000 0001 1000 1111). One shift per byte; the byte is D7 .. D0 = X14, X13, X12, X11, X7, X4, X3, X1, sent MSB first. This
+    // reading gives the first bytes 0xC0 0x6D 0x3F of the standard's text and unscrambled a real L1-Basic from a DekTec modulator.
+    std::vector<uint8_t> out((size_t)n);
+    int x[17];   // x[1] .. x[16]
+    for (int i = 1; i <= 16; i++) x[i] = (0x018F >> (16 - i)) & 1;
+    static const int kD[8] = {14, 13, 12, 11, 7, 4, 3, 1};   // D7 .. D0
     for (int i = 0; i < n; i++) {
-        out[i] = variant == 0 ? r[15] : r[0];
-        int fb = r[15] ^ r[12] ^ r[11] ^ r[10] ^ r[6] ^ r[5] ^ r[2] ^ r[0];
-        for (int j = 15; j > 0; j--) r[j] = r[j - 1];
-        r[0] = fb;
+        out[(size_t)i] = (uint8_t)x[kD[i & 7]];
+        if ((i & 7) != 7) continue;
+        const int fb = x[16];
+        for (int k = 16; k > 1; k--) x[k] = x[k - 1] ^ ((k == 2 || k == 4 || k == 7 || k == 8 || k == 12 || k == 13 || k == 14) ? fb : 0);
+        x[1] = fb;
     }
     return out;
 }

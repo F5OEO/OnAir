@@ -26,8 +26,7 @@ bool parseBbHeader(const uint8_t* data, int size, BbHeader& h);
 // offset in `payload` of the first ALP packet starting in it (-1 if none starts). Returns the packet; `used` receives the number of payload bytes taken.
 std::vector<uint8_t> makeBbPacket(int bytes, const std::vector<uint8_t>& payload, int pointer, int counter, int* used = nullptr);
 
-// Scrambling with the sequence of A/322 5.2.3 (the same operation scrambles and descrambles). `variant` selects between readings of the
-// shift register: 0 is the serial reading used so far; others exist so a receiver can try them against a real signal.
+// Scrambling with the sequence of A/322 5.2.3 (the same operation scrambles and descrambles). `variant` is ignored (kept for callers).
 std::vector<uint8_t> bbScrambleSequence(int bits, int variant = 0);
 void bbScramble(std::vector<uint8_t>& bits, int variant = 0);
 

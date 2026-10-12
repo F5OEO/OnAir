@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <mutex>
 
 namespace dect2 {
 namespace atsc3 {
@@ -17,15 +18,16 @@ constexpr int kZcRoot = 137;             // major version 0
 constexpr int kSeeds[8] = {0x019D, 0x00ED, 0x01E8, 0x00E8, 0x00FB, 0x0021, 0x0054, 0x00EC};
 constexpr int kMaxSymbols = 8;
 
-// Pseudo-noise bits of A/321 5.2.2: 16-bit shift register, polynomial x^16 + x^15 + x^14 + x + 1, output taken before the first clock.
+// Pseudo-noise bits of A/321 5.2.2: 16-bit shift register, polynomial x^16 + x^15 + x^14 + x + 1, output taken before the first clock. The
+// taps (g0, g1, g14, g15) are summed into the input of the register as it shifts right (a Fibonacci register: checked against a recording of a
+// DekTec modulator, a Galois register with the same polynomial gives another sequence).
 std::vector<uint8_t> pnBits(int seed, int count) {
     std::vector<uint8_t> p(count);
     unsigned r = (unsigned)seed & 0xFFFF;
     for (int i = 0; i < count; i++) {
         p[i] = r & 1;
-        unsigned fb = r & 1;
-        r >>= 1;
-        if (fb) r ^= 0xC003;
+        const unsigned fb = (r ^ (r >> 1) ^ (r >> 14) ^ (r >> 15)) & 1;
+        r = (r >> 1) | (fb << 15);
     }
     return p;
 }
@@ -125,36 +127,46 @@ std::vector<cf32> generateBootstrap(const Bootstrap& b) {
     return out;
 }
 
+namespace {
+// The spectrum of the first bootstrap symbol of a seed, conjugated, for the correlation in blocks of F samples. It depends on nothing but the seed and
+// the block size, and the search asks for it for every hypothesis of every candidate: it is made once.
+struct SeedTemplate {
+    std::once_flag once;
+    std::vector<cf32> tf;
+    double energy = 0;
+};
+
+const SeedTemplate& seedTemplate(int seed, int F) {
+    static SeedTemplate cache[2][8];
+    SeedTemplate& t = cache[F > 32768 ? 1 : 0][seed];
+    std::call_once(t.once, [&] {
+        Fft fft(kN), big(F);
+        std::vector<cf32> X, sym((size_t)kBootstrapSymbolLen);
+        freqSymbol(pnBits(kSeeds[seed], (kMaxSymbols + 1) * kNh), 0, X);
+        const float sc = 1.f / std::sqrt((float)(kNzc - 1));
+        for (auto& v : X) v *= sc;
+        timeSymbol(fft, X, 0, false, true, sym.data());
+        t.tf.assign((size_t)F, cf32(0, 0));
+        for (int i = 0; i < kBootstrapSymbolLen; i++) { t.tf[(size_t)i] = sym[(size_t)i]; t.energy += std::norm(sym[(size_t)i]); }
+        big.forward(t.tf.data());
+        for (auto& v : t.tf) v = std::conj(v);
+    });
+    return t;
+}
+} // namespace
+
 Detection detectBootstrap(const cf32* x, size_t n, int seedOnly) {
     Detection d;
     const int L = kBootstrapSymbolLen;
     if (n < (size_t)4 * L) return d;
     Fft fft(kN);
-    std::vector<std::vector<uint8_t>> pns;
-    std::vector<std::vector<cf32>> refs0;   // per seed: first symbol, time domain, for correlation
     const int s0 = seedOnly >= 0 && seedOnly < 8 ? seedOnly : 0, s1 = seedOnly >= 0 && seedOnly < 8 ? seedOnly + 1 : 8;
-    for (int s = 0; s < 8; s++) {
-        pns.push_back(pnBits(kSeeds[s], (kMaxSymbols + 1) * kNh));
-        std::vector<cf32> X, t(L);
-        if (s < s0 || s >= s1) { refs0.push_back(t); continue; }
-        freqSymbol(pns[s], 0, X);
-        float sc = 1.f / std::sqrt((float)(kNzc - 1));
-        for (auto& v : X) v *= sc;
-        timeSymbol(fft, X, 0, false, true, t.data());
-        refs0.push_back(t);
-    }
-    // normalised correlation of the first symbol against every position (blocks with overlap, FFT based)
-    const int F = 1 << 16;
+    // normalised correlation of the first symbol against every position (blocks with overlap, FFT based); a block as short as the data when it fits
+    const int F = n <= 32768 ? 32768 : 65536;
     Fft big(F);
-    std::vector<std::vector<cf32>> tf(8, std::vector<cf32>(F));
-    double Et = 0;
-    for (int s = s0; s < s1; s++) {
-        std::fill(tf[s].begin(), tf[s].end(), cf32(0, 0));
-        for (int i = 0; i < L; i++) tf[s][i] = refs0[s][i];
-        big.forward(tf[s].data());
-        for (auto& v : tf[s]) v = std::conj(v);
-    }
-    for (int i = 0; i < L; i++) Et += std::norm(refs0[s0][i]);
+    std::vector<const SeedTemplate*> tpl(8, nullptr);
+    for (int s = s0; s < s1; s++) tpl[(size_t)s] = &seedTemplate(s, F);
+    const double Et = tpl[(size_t)s0]->energy;
     std::vector<double> csum(n + 1, 0.0);
     for (size_t i = 0; i < n; i++) csum[i + 1] = csum[i] + std::norm(x[i]);
 
@@ -167,7 +179,8 @@ Detection detectBootstrap(const cf32* x, size_t n, int seedOnly) {
         for (size_t i = 0; i < m; i++) blk[i] = x[p0 + i];
         big.forward(blk.data());
         for (int s = s0; s < s1; s++) {
-            for (int i = 0; i < F; i++) prod[i] = blk[i] * tf[s][i];
+            const cf32* tf = tpl[(size_t)s]->tf.data();
+            for (int i = 0; i < F; i++) prod[i] = blk[i] * tf[i];
             big.inverse(prod.data());   // sum over e^{+j}: with the forward transforms above this is F times the cross-correlation
             for (int i = 0; i + L <= (int)m && i < F - L + 1 && p0 + i <= lastStart; i++) {
                 double ew = csum[p0 + i + L] - csum[p0 + i];
@@ -184,6 +197,7 @@ Detection detectBootstrap(const cf32* x, size_t n, int seedOnly) {
     d.info.minorVersion = bestSeed;
 
     // read the symbols: the cyclic shift of each is found by correlating its spectrum with the known one
+    const std::vector<std::vector<uint8_t>> pns{pnBits(kSeeds[bestSeed], (kMaxSymbols + 1) * kNh)};
     std::vector<cf32> X, Y(kN), Z(kN);
     float sc = 1.f / std::sqrt((float)(kNzc - 1));
     cf32 prevPeak(1, 0);
@@ -197,7 +211,7 @@ Detection detectBootstrap(const cf32* x, size_t n, int seedOnly) {
         size_t aStart = base + (s == 0 ? kLenC : 1024);
         for (int i = 0; i < kN; i++) Y[i] = x[aStart + i];
         fft.forward(Y.data());
-        freqSymbol(pns[bestSeed], s, X);
+        freqSymbol(pns[0], s, X);
         for (auto& v : X) v *= sc;
         for (int i = 0; i < kN; i++) Z[i] = Y[i] * std::conj(X[i]);
         fft.forward(Z.data());
