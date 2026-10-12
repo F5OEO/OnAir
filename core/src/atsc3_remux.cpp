@@ -3,6 +3,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -197,6 +199,8 @@ struct Atsc3Remux::Impl {
                 inStreams[ci].push_back(in);
             }
         }
+        // a component that has nothing to put in the output (timed metadata, captions) never delivers a packet: it must not be waited for
+        cs.erase(std::remove_if(cs.begin(), cs.end(), [](Comp* c) { for (int o : c->outStream) if (o >= 0) return false; return true; }), cs.end());
         if (oc->nb_streams == 0) { fail("no picture or sound in the stream"); finishOut(); avformat_free_context(oc); return; }
         if (avformat_write_header(oc, nullptr) < 0) { fail("cannot start the transport stream"); finishOut(); avformat_free_context(oc); return; }
         nStreams = (int)oc->nb_streams;
@@ -205,6 +209,7 @@ struct Atsc3Remux::Impl {
         struct CompClock { int64_t lastRaw = INT64_MIN; int epoch = 0; };
         std::map<Comp*, CompClock> clocks;
         std::vector<int64_t> epochBases;
+        std::map<Comp*, int64_t> lastOut;   // the output time of the last packet taken from each component
         std::vector<int64_t> lastDts(oc->nb_streams, INT64_MIN);
         long idle = 0;
         for (;;) {
@@ -213,16 +218,10 @@ struct Atsc3Remux::Impl {
             AVPacket* pk = nullptr;
             {
                 std::unique_lock<std::mutex> lk(pmu);
-                auto ready = [&]() {
-                    int waiting = 0, have = 0;
-                    for (Comp* c : cs) { if (!c->q.empty()) have++; else if (!c->done) waiting++; }
-                    return have > 0 && waiting == 0;
-                };
-                if (!ready() && !stopping) pcv.wait_for(lk, std::chrono::milliseconds(300));
                 bool any = false, allDone = true;
                 for (Comp* c : cs) { if (!c->q.empty()) any = true; if (!c->done || !c->q.empty()) allDone = false; }
                 if (allDone) break;
-                if (!any) continue;
+                if (!any) { if (!stopping) pcv.wait_for(lk, std::chrono::milliseconds(300)); continue; }
                 for (Comp* c : cs) {
                     if (c->q.empty()) continue;
                     AVPacket* h = c->q.front();
@@ -240,8 +239,18 @@ struct Atsc3Remux::Impl {
                     if (d < best) { best = d; pick = c; }
                 }
                 if (!pick) continue;
-                // a component that has not delivered yet is waited for, but only for a short while
-                if (!ready() && !stopping) { if (++idle < 9) continue; }   // segment delivery is bursty: a component may be a segment behind another, so wait up to about 2.7 s
+                // A component with nothing queued may still send a packet that is older than the one at hand, so it is waited for, but only for a short
+                // while (segment delivery is bursty: a component may be a segment behind another). Once a component has been written past this time
+                // its next packet cannot be older, and nothing needs to wait for it: without that every packet waited for the audio, which arrives in
+                // bursts and is mostly consumed, and the stream ran far slower than real time.
+                bool needWait = false;
+                for (Comp* c : cs) {
+                    if (!c->q.empty() || c->done) continue;
+                    auto lo = lastOut.find(c);
+                    if (lo == lastOut.end() || lo->second < best) needWait = true;
+                }
+                if (needWait && !stopping) { if (++idle < 9) { pcv.wait_for(lk, std::chrono::milliseconds(300)); continue; } }
+                lastOut[pick] = best;
                 idle = 0;
                 pk = pick->q.front();
                 pick->q.pop_front();
