@@ -98,6 +98,48 @@ DECT2_MULTIVERSION void llrCells(const float* pr, const float* pi, int eta, cons
     }
 }
 
+// The same for constellations built from one quadrant (labels: the two top bits say which quadrant, the rest which point of it, w -> -conj(w) ->
+// conj(w) -> -w): the cell is folded into the first quadrant and only the 2^(eta-2) points of that quadrant are measured. The bits of the point
+// come from the nearest points of the bit's two classes inside the quadrant; the two quadrant bits (sign of the imaginary and of the real part)
+// from the nearest point of the quadrant and of its mirror image across the axis in question. Points of the quadrant across both axes are
+// ignored: they are never nearer than the mirror image across one axis.
+DECT2_MULTIVERSION void llrCellsQuad(const float* qa, const float* qb, int eta, const cf32* cells, int nc, float invNv, const int* perm, float* llr) {
+    const int B = 1 << (eta - 2);
+    float d0[64], d1[64], d2[64];
+    for (int s = 0; s < nc; s++) {
+        const float cr = cells[s].real(), ci = cells[s].imag();
+        const float ar = cr < 0 ? -cr : cr, ai = ci < 0 ? -ci : ci;
+        for (int i = 0; i < B; i++) {
+            const float dr = ar - qa[i], dR = ar + qa[i], di = ai - qb[i], dI = ai + qb[i];
+            d0[i] = dr * dr + di * di;
+            d1[i] = dR * dR + di * di;   // mirror image across the imaginary axis (real part flipped)
+            d2[i] = dr * dr + dI * dI;   // across the real axis
+        }
+        float own = 1e30f, flipRe = 1e30f, flipIm = 1e30f;
+        for (int i = 0; i < B; i++) { own = std::min(own, d0[i]); flipRe = std::min(flipRe, d1[i]); flipIm = std::min(flipIm, d2[i]); }
+        // y0: sign of the imaginary part (1 = negative), y1: of the real part
+        const float l0 = ci < 0 ? (own - flipIm) : (flipIm - own), l1 = cr < 0 ? (own - flipRe) : (flipRe - own);
+        llr[perm[s * eta + 0]] = l0 * invNv;
+        llr[perm[s * eta + 1]] = l1 * invNv;
+        for (int k = 2; k < eta; k++) {
+            const int blk = B >> (k - 1);   // points whose bit k is 0 and 1 alternate in runs of this length
+            float m0 = 1e30f, m1 = 1e30f;
+            if (blk >= 8) {
+                float v0[8], v1[8];
+                for (int j = 0; j < 8; j++) v0[j] = v1[j] = 1e30f;
+                for (int base = 0; base < B; base += 2 * blk)
+                    for (int i = 0; i < blk; i += 8)
+                        for (int j = 0; j < 8; j++) { v0[j] = std::min(v0[j], d0[base + i + j]); v1[j] = std::min(v1[j], d0[base + blk + i + j]); }
+                for (int j = 0; j < 8; j++) { m0 = std::min(m0, v0[j]); m1 = std::min(m1, v1[j]); }
+            } else {
+                for (int base = 0; base < B; base += 2 * blk)
+                    for (int i = 0; i < blk; i++) { m0 = std::min(m0, d0[base + i]); m1 = std::min(m1, d0[base + blk + i]); }
+            }
+            llr[perm[s * eta + k]] = (m1 - m0) * invNv;
+        }
+    }
+}
+
 } // namespace
 
 int blockInterleaverType(int n, int eta, int rate15) {
@@ -143,6 +185,15 @@ Bicm::Bicm(const BicmConfig& c) : cfg_(c) {
     kPayload_ = kLdpc_ - mouter;
     points_ = buildPoints(eta, c.rate15);
     if (points_.empty()) return;
+    if (eta >= 2 && eta <= 8) {   // one quadrant and its reflections?
+        const int B = 1 << (eta - 2);
+        bool q = true;
+        for (int i = 0; i < B && q; i++) {
+            const cf32 w = points_[(size_t)i];
+            q = w.real() > 0 && w.imag() > 0 && std::abs(points_[(size_t)(B + i)] - (-std::conj(w))) < 1e-6f && std::abs(points_[(size_t)(2 * B + i)] - std::conj(w)) < 1e-6f && std::abs(points_[(size_t)(3 * B + i)] + w) < 1e-6f;
+        }
+        if (q) { quad_ = true; for (int i = 0; i < B; i++) { qa_.push_back(points_[(size_t)i].real()); qb_.push_back(points_[(size_t)i].imag()); } }
+    }
     int type = blockInterleaverType(n, eta, c.rate15);
     const unsigned short* pi = groupPermutation(n, eta, c.rate15);
     if (type < 0 || !pi) return;
@@ -186,7 +237,8 @@ void Bicm::llrs(const cf32* cells, float noiseVar, std::vector<float>& llr) cons
     if (eta <= 8) {
         std::vector<float> pr((size_t)M), pi((size_t)M);
         for (int m = 0; m < M; m++) { pr[(size_t)m] = points_[(size_t)m].real(); pi[(size_t)m] = points_[(size_t)m].imag(); }
-        llrCells(pr.data(), pi.data(), eta, cells, nc, 1.f / nv, perm_.data(), llr.data());
+        if (quad_) llrCellsQuad(qa_.data(), qb_.data(), eta, cells, nc, 1.f / nv, perm_.data(), llr.data());
+        else llrCells(pr.data(), pi.data(), eta, cells, nc, 1.f / nv, perm_.data(), llr.data());
     } else {
         // separable: one dimension at a time over the 2^(eta/2) levels of that dimension
         const int half = eta / 2, L = 1 << half;

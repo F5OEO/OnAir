@@ -40,6 +40,8 @@ private:
     bool finish(const std::vector<uint8_t>& hard, std::vector<uint8_t>& payload) const;   // outer code on the decoded word
     BicmConfig cfg_;
     bool ok_ = false;
+    bool quad_ = false;                // the constellation is one quadrant and its reflections: faster soft bits
+    std::vector<float> qa_, qb_;       // the points of the first quadrant
     int kPayload_ = 0, kLdpc_ = 0;
     std::vector<cf32> points_;
     std::vector<int> perm_;
