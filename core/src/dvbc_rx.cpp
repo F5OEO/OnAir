@@ -160,6 +160,7 @@ struct DvbcReceiver::Impl {
         std::lock_guard<std::mutex> bl(bmu);
         resync = false; rsBits.clear();
         stage = Acq; acq.clear(); hb.clear(); tau = 0; tnu = 0; strobe = true; agcP = 0; agcN = 0;
+        dcI = {0, 0}; ncoPh = ncoStep = 0; prevStrobe = mid = cf32(0, 0); tedAvg = 0; cfoCoarse = 0; theta = nu = 0;   // nothing numeric survives a reset (a NaN here would poison every later lock)
         syms = stageSyms = 0; zbuf.clear(); bits.clear(); after.clear(); out.clear(); failCycles = 0; usedManual = false; note.clear();
         rsClean = rsCorr = rsFail = packets = packetsBad = 0; cells.clear(); merHist.clear(); errP = 0;
         tb[0].clear(); tb[1].clear();
@@ -524,6 +525,7 @@ struct DvbcReceiver::Impl {
         const size_t o = (size_t)(B - 1) * N;
         for (int i = 0; i < N; i++) { const cf32 a2 = zbuf[o + (size_t)i] * zbuf[o + (size_t)i]; acc += a2 * a2 * std::polar(1.f, (float)(-4 * nu0 * i)); }
         theta0 = (std::arg(acc) - kPi) / 4 + nu0 * N;
+        if (!std::isfinite(nu0) || !std::isfinite(theta0)) { failCycles++; reacq++; stage = Acq; acq.clear(); phBuf.clear(); zbuf.clear(); return; }   // the equaliser blew up: measure again
 
         // move the estimate into the mixer, so that the loops start on a carrier near zero (an echo pulls the spectrum centroid off by tens of kHz).
         // The samples already mixed but not yet filtered get the change too.
@@ -692,6 +694,7 @@ struct DvbcReceiver::Impl {
                 double adv = sps / 2 * (1 + tnu);
                 if (strobe) {
                     const float e = ((y - prevStrobe) * std::conj(mid)).real();
+                    if (!std::isfinite(e) || !std::isfinite(agcP)) { log("the signal overflowed the loops (numbers out of range): starting again"); hardReset(); break; }
                     prevStrobe = y;
                     tedAvg = 0.999 * tedAvg + 0.001 * e;
                     adv -= 0.01 * e * sps / 2;
