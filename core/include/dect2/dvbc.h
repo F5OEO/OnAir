@@ -2,6 +2,7 @@
 // quadrant rule, the differential coding of the two most significant bits, the byte to symbol mapping, and the test transmitter.
 // The outer code (energy dispersal, Reed-Solomon (204,188), Forney interleaver I = 12) is the one of DVB-T (dvbt.h) and is shared with it.
 #pragma once
+#include <algorithm>
 #include "ring.h"
 #include <cmath>
 #include <cstdint>
@@ -31,8 +32,10 @@ struct Constellation {
     std::vector<uint16_t> lut;                  // cells x cells, nearest symbol of each grid cell (corners of the cross constellations included)
     float r2 = 1;                               // CMA modulus E|s|^4 / E|s|^2
     float dmin = 1;
-    int decide(cf32 z) const {
-        int ix = (int)std::floor(z.real() / (2 * unit)) + cells / 2, iy = (int)std::floor(z.imag() / (2 * unit)) + cells / 2;
+    inline __attribute__((always_inline)) int decide(cf32 z) const {
+        // floor() without the library call: shift to positive, truncate (cells <= 16, so +-64 cells is far outside the grid)
+        const float k = 1.f / (2 * unit);
+        int ix = (int)(std::clamp(z.real() * k, -64.f, 64.f) + 64.f) - 64 + cells / 2, iy = (int)(std::clamp(z.imag() * k, -64.f, 64.f) + 64.f) - 64 + cells / 2;
         ix = ix < 0 ? 0 : ix >= cells ? cells - 1 : ix;
         iy = iy < 0 ? 0 : iy >= cells ? cells - 1 : iy;
         return lut[(size_t)iy * (size_t)cells + (size_t)ix];
