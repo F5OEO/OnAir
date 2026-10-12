@@ -116,6 +116,30 @@ static void mappingChecks() {
     }
 }
 
+// A gap in the samples (a radio that loses a few dozen samples now and then) shifts the byte stream; the receiver must find the frame again
+// without giving the lock up: no "lost the stream", and most packets still come out clean.
+static void gapCheck(int qam) {
+    dvbc::SignalConfig sc;
+    sc.qam = qam; sc.symbolRate = 6.875e6; sc.snrDb = 36; sc.sampleRate = 10e6;
+    dvbc::Signal sig(sc);
+    DvbcReceiver rx;
+    rx.configure(10e6);
+    rx.setBlocking(true);
+    int lost = 0;
+    rx.setLogCallback([&](const std::string& m) { if (m.find("lost the stream") != std::string::npos) lost++; });
+    uint64_t pk = 0, ok = 0;
+    rx.setPacketCallback([&](const uint8_t* p, size_t n, double) { for (size_t i = 0; i < n; i++) { pk++; ok += !(p[188 * i + 1] & 0x80); } });
+    std::vector<cf32> buf(32768);
+    for (size_t k = 0; k < 150; k++) {
+        sig.generate(buf.data(), buf.size());
+        if (k > 20 && k % 8 == 0) rx.feed(buf.data() + 41, buf.size() - 41); else rx.feed(buf.data(), buf.size());   // 41 samples lost every 8th buffer
+    }
+    rx.flush();
+    printf("  %-28s packets %llu clean %llu lost-stream %d\n", "sample gaps", (unsigned long long)pk, (unsigned long long)ok, lost);
+    CHECK(lost == 0, "qam %d: the lock was given up %d times after a sample gap", qam, lost);
+    CHECK(ok * 10 > pk * 9 && pk > 5000, "qam %d: only %llu of %llu packets clean around sample gaps", qam, (unsigned long long)ok, (unsigned long long)pk);
+}
+
 int main(int argc, char** argv) {
     mappingChecks();
     const Case cases[] = {
@@ -141,6 +165,7 @@ int main(int argc, char** argv) {
         {"256-QAM HackRF phase noise", 4, 6.875e6, 36, 1.5e3, -80, 0, false, false, 6.875e6, -1, 1.5, 0, 0.035},
     };
     for (const auto& c : cases) if (argc < 2 || strstr(c.name, argv[1])) run(c);
+    gapCheck(4); gapCheck(1);
     printf(fails ? "dvbc rx: %d FAILED\n" : "dvbc rx: all passed\n", fails);
     return fails ? 1 : 0;
 }
