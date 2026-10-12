@@ -497,6 +497,12 @@ EXPORT long long iio_device_attr_read(const void* dev, const char* a, char* dst,
     snprintf(dst, len, "40000000");
     return (long long)strlen(dst) + 1;
 }
+EXPORT long long iio_device_attr_write(const void* dev, const char* a, const char* v) {   // the AD9361's FIR filter, loaded as text
+    if (strcmp(a, "filter_fir_config") != 0) return -22;
+    count("pluto.firLoads");
+    rec((std::string("pluto.") + (const char*)dev + ".firTaps").c_str(), (double)std::count(v, v + strlen(v), '\n') - 2);   // lines less the two headers
+    return (long long)strlen(v);
+}
 EXPORT int iio_device_attr_write_longlong(const void* dev, const char* a, long long v) { rec((std::string("pluto.") + (const char*)dev + "." + a).c_str(), (double)v); count("pluto.xoWrites"); return 0; }
 EXPORT int uhd_usrp_set_clock_source(void*, const char* src, size_t mb) { rec("usrp.clock", strcmp(src, "internal") == 0 ? 1 : strcmp(src, "external") == 0 ? 2 : strcmp(src, "gpsdo") == 0 ? 3 : 0); rec("usrp.clockMb", (double)mb); count("usrp.clockCalls"); return 0; }
 EXPORT int uhd_get_last_error(char* out, size_t len) { snprintf(out, len, "%s", "fake UHD error"); return 0; }

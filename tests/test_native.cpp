@@ -820,7 +820,16 @@ static void radioSettingsChecks(const char* dir, const char* ext) {
             CHECK(src->retune(t, e) && st("pluto.phy.xo_correction") == 40000400 && st("pluto.phy:altvoltage0.frequency") == 522e6, "Pluto 10 ppm: xo %.0f, freq %.0f", st("pluto.phy.xo_correction"), st("pluto.phy:altvoltage0.frequency"));
             t.radio["gainmode"] = "fast_attack"; t.gainDb = 50;
             CHECK(src->retune(t, e) && st("pluto.phy:voltage0.gain_control_mode=fast_attack") == 1 && st("pluto.phy:voltage0.hardwaregain") == 30, "Pluto fast attack: gain written %.0f", st("pluto.phy:voltage0.hardwaregain"));
+            // 2.048 Msps (DAB): below the converter's 2.083 Msps, so through its decimating FIR (the converter at twice the rate), off again for another rate
+            t.sampleRate = 2.048e6;
+            CHECK(src->retune(t, e) && st("pluto.phy:voltage0.sampling_frequency") == 2.048e6 && st("pluto.phy:voltage0.filter_fir_en") == 1 && st("pluto.firLoads") == 1 && st("pluto.phy.firTaps") == 16,
+                  "Pluto 2.048 Msps: rate %.0f, FIR en %.0f, loads %.0f, taps %.0f (%s)", st("pluto.phy:voltage0.sampling_frequency"), st("pluto.phy:voltage0.filter_fir_en"), st("pluto.firLoads"), st("pluto.phy.firTaps"), e.c_str());
+            t.sampleRate = 10e6;
+            CHECK(src->retune(t, e) && st("pluto.phy:voltage0.sampling_frequency") == 10e6 && st("pluto.phy:voltage0.filter_fir_en") == 0, "Pluto 10 Msps after the FIR: rate %.0f, FIR en %.0f", st("pluto.phy:voltage0.sampling_frequency"), st("pluto.phy:voltage0.filter_fir_en"));
+            t.sampleRate = 2.048e6;
+            CHECK(src->retune(t, e) && st("pluto.phy:voltage0.filter_fir_en") == 1, "Pluto 2.048 Msps again");
             src->stop();
+            CHECK(st("pluto.phy:voltage0.filter_fir_en") == 0, "Pluto: the FIR left on at stop");
             CHECK(st("pluto.phy.xo_correction") == 40000000, "Pluto: reference clock not restored at stop (%.0f)", st("pluto.phy.xo_correction"));
         }
     }

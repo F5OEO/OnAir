@@ -8,7 +8,8 @@ namespace dect2 {
 class RationalResampler {
 public:
     // Finds a small L/M approximating outRate/inRate. Returns false if no good ratio exists.
-    bool configure(double inRate, double outRate, double* relError = nullptr);
+    // occupiedHz > 0 (decimating): the signal is that wide, so the filter is sized for it, not for the whole output band (fewer taps).
+    bool configure(double inRate, double outRate, double* relError = nullptr, double occupiedHz = 0);
     bool passthrough() const { return L_ == 1 && M_ == 1; }
     int L() const { return L_; }
     int M() const { return M_; }

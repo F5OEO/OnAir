@@ -753,7 +753,7 @@ void DabReceiver::configure(double inputRateHz) {
     Impl& I = *p_;
     I.inRate = inputRateHz;
     I.resample = std::fabs(inputRateHz - kRate) > 1.0;
-    if (I.resample) I.rs.configure(inputRateHz, kRate);
+    if (I.resample) I.rs.configure(inputRateHz, kRate, nullptr, 1.6e6);
     I.cc.configure(inputRateHz, 1.536e6, 60e3, 1.5);
     I.reset();
 }

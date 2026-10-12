@@ -36,6 +36,7 @@ struct IioApi {
     // optional: device attributes (the AD9361's reference clock, "xo_correction", for the frequency correction)
     long long (DECT2_CALL* device_attr_read)(const iio_device*, const char*, char*, size_t) = nullptr;
     int (DECT2_CALL* device_attr_write_longlong)(const iio_device*, const char*, long long) = nullptr;
+    long long (DECT2_CALL* device_attr_write)(const iio_device*, const char*, const char*) = nullptr;   // optional: the AD9361's FIR filter is loaded as text
     // optional: the context attributes, where the firmware names itself ("fw_version", "tezuka-v0.3.21" on a Tezuka)
     const char* (DECT2_CALL* context_get_attr_value)(const iio_context*, const char*) = nullptr;
     int (DECT2_CALL* device_set_kernel_buffers_count)(const iio_device*, unsigned) = nullptr;   // optional: more buffers queued in the kernel
@@ -69,7 +70,7 @@ struct IioApi {
              lib.get(buffer_start, "iio_buffer_start") && lib.get(buffer_end, "iio_buffer_end");
         if (ok) {
             lib.opt(channel_attr_read, "iio_channel_attr_read"); lib.opt(strerror_, "iio_strerror");
-            lib.opt(device_attr_read, "iio_device_attr_read"); lib.opt(device_attr_write_longlong, "iio_device_attr_write_longlong");
+            lib.opt(device_attr_read, "iio_device_attr_read"); lib.opt(device_attr_write_longlong, "iio_device_attr_write_longlong"); lib.opt(device_attr_write, "iio_device_attr_write");
             lib.opt(context_get_attr_value, "iio_context_get_attr_value");
             lib.opt(device_set_kernel_buffers_count, "iio_device_set_kernel_buffers_count");
         }
@@ -93,6 +94,18 @@ std::string mhz(double hz) {
     const double m = hz / 1e6;
     snprintf(b, sizeof b, std::fabs(m - std::round(m)) < 1e-6 ? "%.0f" : "%.6g", m);
     return b;
+}
+
+// Below 2.083 Msps the AD9361 needs its decimating FIR: the converter runs at twice the rate and the FIR (16 taps is all its clock chain allows
+// here) halves it. This one is a lowpass at 0.23 of the converter rate (0.46 of the output): -1 dB at 0.38, 42 dB down from 0.61. It gives DAB its
+// 2.048 Msps straight from the radio: no resampling in software, half the data over the cable. Taps are in 1/32768 (the same for RX and TX).
+constexpr long long kFirTaps[16] = {-282, -25, 891, 389, -2075, -1732, 5360, 13694, 13694, 5360, -1732, -2075, 389, 891, -25, -282};
+constexpr double kFirMaxRate = 2.1e6, kFirMinRate = 2.048e6;   // the output rates the FIR is used for (the converter itself runs 2.083 Msps and up)
+bool wantsFir(double rateHz) { return rateHz >= kFirMinRate - 1 && rateHz < kFirMaxRate; }
+std::string firConfig() {
+    std::string c = "RX 3 GAIN 0 DEC 2\nTX 3 GAIN 0 INT 2\n";
+    for (long long t : kFirTaps) c += std::to_string(t) + "," + std::to_string(t) + "\n";
+    return c;
 }
 
 constexpr double kUsbMaxRate = 4e6;   // USB 2: the continuous rate a Pluto keeps up without losing samples (measured)
@@ -233,8 +246,15 @@ protected:
         if (!live) {
             if (buf_) { iio().buffer_destroy(buf_); buf_ = nullptr; }
             // the converter runs 0.52 - 61.44 Msps; below 2.083 Msps it needs a decimation filter: stay at or above that
-            const double want = std::min(std::max(s.sampleRate > 0 ? s.sampleRate : 10e6, 2.1e6), 61.44e6);
-            if (const int r = iio().channel_attr_write_longlong(rxCh_, "sampling_frequency", (long long)std::llround(want)); r != 0) { err = "PlutoSDR: the sample rate was refused: " + iio().text(r); return false; }
+            double want = std::min(std::max(s.sampleRate > 0 ? s.sampleRate : 10e6, 2.1e6), 61.44e6);
+            if (firOn_) setFir(false);   // a rate chosen now may not be one for the FIR
+            if (wantsFir(s.sampleRate)) {
+                // 2.048 Msps: the converter at twice that, the FIR (loaded and switched on there) halves it
+                if (setFirRate(s.sampleRate)) want = s.sampleRate;
+                else { fprintf(stderr, "PlutoSDR: the radio did not accept the decimating FIR: running at 2.1 Msps, resampled in software\n"); fflush(stderr); }
+            }
+            if (!firOn_)
+                if (const int r = iio().channel_attr_write_longlong(rxCh_, "sampling_frequency", (long long)std::llround(want)); r != 0) { err = "PlutoSDR: the sample rate was refused: " + iio().text(r); return false; }
             // Tezuka: with only the first channel enabled the FPGA sends 8-bit I/Q pairs (half the bytes on the cable, twice the rate); both: 16-bit
             cs8_ = tezuka_ && radioOption(s, "iqformat", "cs16") == "cs8";
             if (overUsbCable(uri_)) {
@@ -296,7 +316,28 @@ protected:
         }
         return true;
     }
+    // Switches the AD9361's FIR on or off (it is one switch for both directions); only ever turned off when this source turned it on
+    void setFir(bool on) {
+        if (on == firOn_) return;
+        if (iio().channel_attr_write_longlong(rxCh_, "filter_fir_en", on ? 1 : 0) == 0) firOn_ = on;
+        else if (!on) firOn_ = false;
+    }
+    // The FIR for `outHz`: converter at 2 * outHz with the filter off, filter loaded, switched on, then the output rate. False if the radio refuses
+    bool setFirRate(double outHz) {
+        if (!iio().device_attr_write || !phy_) return false;
+        if (iio().channel_attr_write_longlong(rxCh_, "sampling_frequency", (long long)std::llround(2 * outHz)) != 0) return false;
+        const std::string cfg = firConfig();
+        if (iio().device_attr_write(phy_, "filter_fir_config", cfg.c_str()) < 0) return false;
+        if (iio().channel_attr_write_longlong(rxCh_, "filter_fir_en", 1) != 0) return false;
+        firOn_ = true;
+        if (iio().channel_attr_write_longlong(rxCh_, "sampling_frequency", (long long)std::llround(outHz)) != 0) { setFir(false); return false; }
+        return true;
+    }
     void closeDevice() override {
+        if (firOn_ && rxCh_) {   // the radio goes back to a rate it can run without the FIR
+            iio().channel_attr_write_longlong(rxCh_, "sampling_frequency", (long long)std::llround(2 * rate_));
+            setFir(false);
+        }
         // the Pluto keeps its settings after OnAir lets go of it: the reference clock goes back to what it was
         if (phy_ && xoBase_ > 0 && xoPpm_ != 0) iio().device_attr_write_longlong(phy_, "xo_correction", std::llround(xoBase_));
         xoPpm_ = 0;
@@ -342,6 +383,7 @@ private:
     IioApi::iio_channel* q_ = nullptr;
     IioApi::iio_buffer* buf_ = nullptr;
     double loHz_ = 70e6, hiHz_ = 6e9;
+    bool firOn_ = false;              // the decimating FIR was switched on by this source
     double xoBase_ = 0, xoPpm_ = 0;   // the reference clock at open (0 = cannot be corrected) and the correction applied to it
     std::string gainMode_;            // the gain_control_mode written
     std::string fw_;                  // the firmware version the board reports ("" when it does not say)
@@ -360,7 +402,7 @@ DeviceInfo plutoEntry(const std::string& uri, const std::string& desc, bool prob
     d.name = "PlutoSDR " + (desc.empty() ? uri : "(" + uri + ")") + (probe ? " (native, experimental)" : " (network)");
     // over USB 2 a Pluto keeps up with about 4 Msps (3 over its USB-gadget network address); over a real network the converter's full rate is offered
     // a mode that needs more still gets it (linkRateFor: some lost samples beat no decode, e.g. DVB-T/T2 at 64/7 Msps)
-    d.maxRateHz = 61.44e6; d.minRateHz = 2.1e6;
+    d.maxRateHz = 61.44e6; d.minRateHz = kFirMinRate;   // 2.048 Msps through the FIR; a converter rate from 2.083 Msps up otherwise
     d.steadyRateHz = plutoLinkRate(uri);
     d.gainMinDb = 0; d.gainMaxDb = 73;
     d.minFreqHz = 70e6; d.maxFreqHz = 6e9;
