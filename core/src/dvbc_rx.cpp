@@ -33,6 +33,7 @@ constexpr int kPhases = 256;
 constexpr size_t kAcqN = 65536, kAcqBlocks = 4;
 constexpr uint64_t kCmaSyms = 400000, kDdSyms = 60000;
 constexpr size_t kSyncBlocks = 20;
+constexpr int kResyncBad = 12;   // consecutive uncorrectable blocks that start a byte re-alignment (a slipped symbol clock or a gap in the samples shifts the bytes, the carrier is still fine)
 constexpr size_t kPhBlock = 1024, kPhMargin = 16;   // phase smoothing: symbols per block, and the overlap on each side
 constexpr int kPhHalf = 5;
 
@@ -142,6 +143,9 @@ struct DvbcReceiver::Impl {
     std::vector<uint8_t> bits, after;
     dvbt::ConvInterleaver deint{true};
     int warm = 0, groupIdx = 0, consecBad = 0;
+    bool resync = false;                   // looking for the 204-byte frame again in the bits that follow
+    std::vector<uint8_t> rsBits;
+    std::atomic<uint64_t> resyncs{0};
     bool haveGroup = false;
     uint64_t rsClean = 0, rsCorr = 0, rsFail = 0, packets = 0, packetsBad = 0, reacq = 0;
     double byteErr = 0;
@@ -154,6 +158,7 @@ struct DvbcReceiver::Impl {
     void hardReset() {
         backStop(); lostFlag = false;
         std::lock_guard<std::mutex> bl(bmu);
+        resync = false; rsBits.clear();
         stage = Acq; acq.clear(); hb.clear(); tau = 0; tnu = 0; strobe = true; agcP = 0; agcN = 0;
         syms = stageSyms = 0; zbuf.clear(); bits.clear(); after.clear(); out.clear(); failCycles = 0; usedManual = false; note.clear();
         rsClean = rsCorr = rsFail = packets = packetsBad = 0; cells.clear(); merHist.clear(); errP = 0;
@@ -411,6 +416,7 @@ struct DvbcReceiver::Impl {
     std::atomic<uint64_t> gen{0};
     std::atomic<bool> lostFlag{false};
     Smooth smB;
+    uint64_t resyncsLogged = 0;
     double pendSecs = 0;   // stream time handed over since the last packet callback: the callback is told how long the packets span, not when they are
 
     void offload() {
@@ -473,7 +479,7 @@ struct DvbcReceiver::Impl {
         backStop();
         log("lost the stream, searching again");
         reacq++;
-        { std::lock_guard<std::mutex> bl(bmu); bits.clear(); after.clear(); haveGroup = false; }
+        { std::lock_guard<std::mutex> bl(bmu); bits.clear(); after.clear(); haveGroup = false; resync = false; rsBits.clear(); }
         lostFlag = false; pendSecs = 0;
         stage = Cma; stageSyms = 0; phBuf.clear();
     }
@@ -560,7 +566,7 @@ struct DvbcReceiver::Impl {
             tb[0].clear(); tb[1].clear();
             dm[0] = dm[v];
             deint = dvbt::ConvInterleaver(true);
-            warm = 12; haveGroup = false; after.clear(); consecBad = 0;
+            warm = 12; haveGroup = false; after.clear(); consecBad = 0; resync = false; rsBits.clear();
             stage = Locked; lockedAt = processed; failCycles = 0; pendSecs = 0;
             char m[160];
             snprintf(m, sizeof m, "%s locked%s, %.4f Msym/s, MER %.1f dB", dvbc::qamName(qam), inv ? " (spectrum inverted)" : "", rs / (1 + tnu) / 1e6, mer());
@@ -578,6 +584,19 @@ struct DvbcReceiver::Impl {
 
     // ---------------------------------------------------------------- outer decoder
     void outer() {
+        if (resync) {   // collect enough bits to find the frame start again, then carry on from there; failing that, search from scratch
+            rsBits.insert(rsBits.end(), bits.begin(), bits.end());
+            bits.clear();
+            if (rsBits.size() < 8 * 204 * (kSyncBlocks + 4)) return;
+            const long off = findSync(rsBits);
+            resync = false;
+            if (off < 0) { rsBits.clear(); lostFlag = true; return; }
+            bits.assign(rsBits.begin() + off, rsBits.end());
+            rsBits.clear();
+            deint = dvbt::ConvInterleaver(true);
+            warm = 12; haveGroup = false; after.clear(); consecBad = 0;
+            resyncs++;
+        }
         const size_t nb = bits.size() / 8 / 12 * 12;
         if (!nb) return;
         std::vector<uint8_t> by(nb), di(nb);
@@ -607,6 +626,10 @@ struct DvbcReceiver::Impl {
                 packets++;
                 out.insert(out.end(), pkt, pkt + 188);
             }
+            if (consecBad >= kResyncBad && !resync) {   // the frame position has probably moved: look for it before giving the lock up
+                resync = true; rsBits.clear(); bits.clear(); after.clear(); haveGroup = false;
+                return;
+            }
             if (consecBad >= 48) {
                 lostFlag = true;   // the receiver thread restarts the search
                 bits.clear(); after.clear(); haveGroup = false;
@@ -630,6 +653,7 @@ struct DvbcReceiver::Impl {
                 continue;
             }
             if (lostFlag.load() && stage == Locked) handleLost();
+            if (const uint64_t r = resyncs.load(); r != resyncsLogged) { resyncsLogged = r; log("bytes re-aligned without losing the lock"); }
             // mix and filter a chunk
             const size_t take = std::min<size_t>(n - i, 16384);
             // the mixer is a rotating phasor (renormalised every 256 samples), not a sin/cos per sample
