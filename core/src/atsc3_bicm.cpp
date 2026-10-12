@@ -14,6 +14,8 @@ namespace atsc3 {
 
 namespace {
 
+constexpr float kLlrLimit = 20.f;
+
 // Table 6.8 and 6.9: block interleaver type (0 = A, 1 = B), rates 2/15 .. 13/15
 const char* kTypes64[6] = {"AAAAAAAAAAAA", "AAABAABBAAAA", "AAAAABABBAAB", "AAABBBBABBAB", "AAABABABBBAA", "AAAAABAAAAAA"};
 const char* kTypes16[4] = {"AAAABBABAAAA", "AAAABBABABAB", "AAAABBABAAAA", "AAAABAAAABAA"};
@@ -199,6 +201,9 @@ bool Bicm::decode(const cf32* cells, float noiseVar, std::vector<uint8_t>& paylo
             }
         }
     }
+    // a few confidently wrong values (a cell the equaliser got wrong, noise the estimate left out) are as strong as many right ones for the min-sum
+    // decoder and keep it from converging although the rest is clean: no value counts for more than this
+    for (auto& v : llr) v = std::max(-kLlrLimit, std::min(kLlrLimit, v));
     std::vector<uint8_t> hard;
     if (!ldpcCode(cfg_.nInner, cfg_.rate15).decode(llr, 60, hard, iters)) return false;
     std::vector<uint8_t> bits(hard.begin(), hard.begin() + kLdpc_);

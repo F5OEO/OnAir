@@ -38,5 +38,15 @@ std::vector<cf32> modulateSubframeSymbol(const SubframeParams& s, int l, const s
 // The reverse; the cells come back in the order they were passed to the modulator.
 bool demodulateSubframeSymbol(const SubframeParams& s, int l, const cf32* x, std::vector<cf32>& cells, float* noiseVar = nullptr);
 
+// The same in steps, so that the channel estimates of neighbouring symbols can be averaged: the FFT and the channel estimate of a symbol, the
+// estimate of symbol l averaged with those of the `half` symbols on each side (their common phase taken off), and the equalised cells.
+struct SymbolRx {
+    std::vector<cf32> y, hch;
+    float nv = 0;
+};
+bool receiveSymbol(const SubframeParams& s, int l, const cf32* x, SymbolRx& rx);
+void smoothChannel(const std::vector<SymbolRx>& rx, int l, int half, std::vector<cf32>& out);
+void symbolCells(const SubframeParams& s, int l, const SymbolRx& rx, const std::vector<cf32>& hch, std::vector<cf32>& cells);
+
 } // namespace atsc3
 } // namespace dect2

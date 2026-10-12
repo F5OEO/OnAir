@@ -76,6 +76,9 @@ private:
     std::unique_ptr<RouteService> route_;
     std::map<std::string, int> remuxIds_;          // component key -> remux component id
     std::map<int, std::vector<uint8_t>> lastInit_;
+    struct CtiPlp;
+    PlpResult runCti(const PlpResult& in);          // de-interleaves a CTI PLP's cells in frame order and decodes the FEC blocks that are complete
+    std::map<int, std::unique_ptr<CtiPlp>> cti_;   // by PLP id
     Atsc3Remux remux_;
     ReceiverStats st_;
     FrameInfo info_;

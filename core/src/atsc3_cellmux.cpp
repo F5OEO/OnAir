@@ -62,15 +62,20 @@ bool demodulateSubframe(const SubframeParams& s, const cf32* x, size_t n, std::v
     const size_t symLen = (size_t)s.fftSize + s.guard;
     if (n < symLen * s.numSymbols) return false;
     active.clear();
+    // the channel estimate of every symbol is averaged with those of its neighbours (a few symbols are far shorter than the channel changes)
+    std::vector<SymbolRx> rx((size_t)s.numSymbols);
+    for (int l = 0; l < s.numSymbols; l++)
+        if (!receiveSymbol(s, l, x + symLen * l, rx[(size_t)l])) return false;
+    const int half = 0;   // averaging over 2 symbols on each side made no difference on a real capture (-33 dB error vector at the decoder), so it is off
+    std::vector<cf32> h, cells;
     for (int l = 0; l < s.numSymbols; l++) {
-        std::vector<cf32> cells;
-        float nv = 0;
-        if (!demodulateSubframeSymbol(s, l, x + symLen * l, cells, &nv)) return false;
+        smoothChannel(rx, l, half, h);
+        symbolCells(s, l, rx[(size_t)l], h, cells);
         int nd = (int)cells.size();
         int nulls = isBoundarySymbol(s, l) ? s.sbsNullCells : 0;
         for (int i = nulls / 2; i < nd - (nulls - nulls / 2); i++) {
-            active.push_back(cells[i]);
-            if (noiseVar) noiseVar->push_back(nv);
+            active.push_back(cells[(size_t)i]);
+            if (noiseVar) noiseVar->push_back(rx[(size_t)l].nv);
         }
     }
     return true;

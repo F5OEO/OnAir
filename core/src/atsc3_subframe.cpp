@@ -3,12 +3,14 @@
 #include "dect2/fftutil.h"
 #include <algorithm>
 #include <cmath>
+#include <complex>
 
 namespace dect2 {
 namespace atsc3 {
 
 namespace {
 
+const float kFadeErase = 0.1f;
 const int kDx[16] = {3, 3, 4, 4, 6, 6, 8, 8, 12, 12, 16, 16, 24, 24, 32, 32};
 const int kDy[16] = {2, 4, 2, 4, 2, 4, 2, 4, 2, 4, 2, 4, 2, 4, 2, 4};
 
@@ -150,7 +152,7 @@ std::vector<cf32> modulateSubframeSymbol(const SubframeParams& s, int l, const s
     return out;
 }
 
-bool demodulateSubframeSymbol(const SubframeParams& s, int l, const cf32* x, std::vector<cf32>& cells, float* noiseVar) {
+bool receiveSymbol(const SubframeParams& s, int l, const cf32* x, SymbolRx& rx) {
     const int noc = numCarriers(s.fftSize, s.cred);
     auto kind = subframeCarrierKinds(s, l);
     auto r = referenceSequence(noc);
@@ -161,26 +163,67 @@ bool demodulateSubframeSymbol(const SubframeParams& s, int l, const cf32* x, std
     Fft fft(N);
     fft.forward(bins.data());
     const int mid = (noc - 1) / 2;
-    std::vector<cf32> y(noc);
+    std::vector<cf32>& y = rx.y;
+    y.resize(noc);
     for (int k = 0; k < noc; k++) y[k] = bins[((k - mid) % N + N) % N];
     std::vector<int> pk;
     std::vector<cf32> ph;
     for (int k = 0; k < noc; k++) {
         if (kind[k] == 0) continue;
+        if (std::abs(k - mid) <= 1 && noc > 64) continue;   // the receiver's DC offset lands on the middle carrier: a pilot there would give a wild channel estimate
         double a = kind[k] == 2 ? acp : asp;
         pk.push_back(k);
         ph.push_back(y[k] / (float)(2 * a * (0.5 - r[k])));
     }
     if (pk.size() < 2) return false;
-    std::vector<cf32> hch(noc);
+    std::vector<cf32>& hch = rx.hch;
+    hch.resize(noc);
     size_t seg = 0;
     for (int k = 0; k < noc; k++) {
         while (seg + 2 < pk.size() && pk[seg + 1] < k) seg++;
         float t = (float)(k - pk[seg]) / (float)(pk[seg + 1] - pk[seg]);
         hch[k] = ph[seg] * (1 - t) + ph[seg + 1] * t;
     }
+    double nv = 0; int nn = 0;
+    for (size_t i = 0; i + 1 < pk.size(); i++) if (pk[i + 1] - pk[i] <= 2 * spDx(s.spPattern)) { nv += std::norm(ph[i + 1] - ph[i]) / 2.0; nn++; }
+    double hm = 0;
+    for (auto& c : hch) hm += std::norm(c);
+    hm /= noc;
+    rx.nv = (nn && hm > 0) ? (float)(nv / nn * asp * asp / hm) : 0.f;
+    return true;
+}
+
+void smoothChannel(const std::vector<SymbolRx>& rx, int l, int half, std::vector<cf32>& out) {
+    const std::vector<cf32>& h0 = rx[l].hch;
+    const size_t noc = h0.size();
+    out = h0;
+    if (half <= 0) return;
+    std::vector<cf32> acc(h0);
+    int count = 1;
+    for (int j = std::max(0, l - half); j <= std::min((int)rx.size() - 1, l + half); j++) {
+        if (j == l || rx[j].hch.size() != noc) continue;
+        // the common phase between the two symbols (carrier offset, phase noise) is taken off before averaging
+        std::complex<double> c(0, 0);
+        for (size_t k = 0; k < noc; k++) c += std::complex<double>(h0[k]) * std::conj(std::complex<double>(rx[j].hch[k]));
+        const float m = std::abs(c) > 0 ? 1.f / (float)std::abs(c) : 0.f;
+        const cf32 rot((float)c.real() * m, (float)c.imag() * m);
+        for (size_t k = 0; k < noc; k++) acc[k] += rx[j].hch[k] * rot;
+        count++;
+    }
+    const float inv = 1.f / (float)count;
+    for (size_t k = 0; k < noc; k++) out[k] = acc[k] * inv;
+}
+
+void symbolCells(const SubframeParams& s, int l, const SymbolRx& rx, const std::vector<cf32>& hch, std::vector<cf32>& cells) {
+    const int noc = numCarriers(s.fftSize, s.cred);
+    auto kind = subframeCarrierKinds(s, l);
     std::vector<cf32> a;
-    for (int k = 0; k < noc; k++) if (kind[k] == 0) a.push_back(y[k] / hch[k]);
+    {   // cells in a deep fade of the channel estimate are mostly noise: they become erasures (zero, which the decoders read as no information)
+        double hm = 0;
+        for (int k = 0; k < noc; k++) hm += std::norm(hch[k]);
+        const float lim = (float)(kFadeErase * hm / noc);
+        for (int k = 0; k < noc; k++) if (kind[k] == 0) a.push_back(std::norm(hch[k]) < lim ? cf32(0, 0) : rx.y[k] / hch[k]);
+    }
     const int nd = (int)a.size();
     cells.assign(nd, cf32(0, 0));
     if (s.freqInterleaver) {
@@ -189,14 +232,13 @@ bool demodulateSubframeSymbol(const SubframeParams& s, int l, const cf32* x, std
         if (s.fftSize == 32768 && (fl % 2) == 0) { for (int q = 0; q < nd; q++) cells[q] = a[h[q]]; }
         else { for (int q = 0; q < nd; q++) cells[h[q]] = a[q]; }
     } else cells = a;
-    if (noiseVar) {
-        double nv = 0; int nn = 0;
-        for (size_t i = 0; i + 1 < pk.size(); i++) if (pk[i + 1] - pk[i] <= 2 * spDx(s.spPattern)) { nv += std::norm(ph[i + 1] - ph[i]) / 2.0; nn++; }
-        double hm = 0;
-        for (auto& c : hch) hm += std::norm(c);
-        hm /= noc;
-        *noiseVar = (nn && hm > 0) ? (float)(nv / nn * asp * asp / hm) : 0.f;
-    }
+}
+
+bool demodulateSubframeSymbol(const SubframeParams& s, int l, const cf32* x, std::vector<cf32>& cells, float* noiseVar) {
+    SymbolRx rx;
+    if (!receiveSymbol(s, l, x, rx)) return false;
+    symbolCells(s, l, rx, rx.hch, cells);
+    if (noiseVar) *noiseVar = rx.nv;
     return true;
 }
 

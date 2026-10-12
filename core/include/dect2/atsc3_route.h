@@ -41,7 +41,8 @@ struct RouteObject {
 class RouteReceiver {
 public:
     // Adds a packet; completed objects are appended to `done`. An object is complete when all bytes up to its length (EXT_TOL, or the packet
-    // with the close object flag) have arrived.
+    // with the close object flag) have arrived. A sender that signals neither (some encoders do not) ends an object by starting the next one: an
+    // object whose bytes are contiguous from 0 and form whole MP4 boxes is complete when a newer object of the same TSI begins.
     void push(const LctPacket& p, std::vector<RouteObject>& done);
     void clear() { open_.clear(); }
     size_t openObjects() const { return open_.size(); }

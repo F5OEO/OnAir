@@ -88,9 +88,38 @@ std::vector<uint8_t> makeRoutePacket(const LctPacket& p, bool withToL) {
     return v;
 }
 
+namespace {
+// whole ISO BMFF boxes from end to end
+bool wholeBoxes(const std::vector<uint8_t>& d, size_t n) {
+    size_t pos = 0;
+    if (n < 8) return false;
+    while (pos < n) {
+        if (pos + 8 > n) return false;
+        uint64_t size = be32(d.data() + pos);
+        if (size == 1) { if (pos + 16 > n) return false; size = ((uint64_t)be32(d.data() + pos + 8) << 32) | be32(d.data() + pos + 12); }
+        else if (size == 0) return true;   // to the end of the file
+        if (size < 8 || pos + size > n) return false;
+        pos += (size_t)size;
+    }
+    return pos == n;
+}
+}
+
 void RouteReceiver::push(const LctPacket& p, std::vector<RouteObject>& done) {
     counter_++;
     auto key = std::make_pair(p.tsi, p.toi);
+    if (!open_.count(key) && p.startOffset == 0) {   // a new object: older ones of the TSI without a signalled length may have ended
+        for (auto it = open_.begin(); it != open_.end();) {
+            Open& q = it->second;
+            if (it->first.first == p.tsi && q.length < 0 && q.ranges.size() == 1 && q.ranges[0].first == 0 && wholeBoxes(q.data, q.ranges[0].second)) {
+                RouteObject r;
+                r.tsi = it->first.first; r.toi = it->first.second; r.codePoint = q.codePoint; r.hasSct = q.hasSct; r.sct = q.sct;
+                r.data.assign(q.data.begin(), q.data.begin() + q.ranges[0].second);
+                done.push_back(std::move(r));
+                it = open_.erase(it);
+            } else ++it;
+        }
+    }
     Open& o = open_[key];
     o.age = counter_;
     o.codePoint = p.codePoint;

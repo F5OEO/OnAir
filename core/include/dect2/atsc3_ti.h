@@ -32,6 +32,8 @@ public:
     cf32 push(cf32 in);
     std::vector<cf32> process(const std::vector<cf32>& in);
     int latency() const { return rows_ * (rows_ - 1); }   // cells before the output is the real signal
+    int rows() const { return rows_; }
+    int row() const { return row_; }                      // the commutator: the row the next cell goes to
 private:
     int rows_, row_;
     std::vector<std::deque<cf32>> lines_;

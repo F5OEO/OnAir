@@ -1,4 +1,5 @@
 #include "dect2/atsc3_frame.h"
+#include "dect2/atsc3_ti.h"
 #include "dect2/atsc3_bb.h"
 #include <algorithm>
 #include <cmath>
@@ -140,7 +141,20 @@ FrameResult decodeFrame(const cf32* x, size_t n, const Bootstrap& bs) {
         Bicm bicm(bc);
         PlpAlloc a;
         a.start = pl.start; a.size = pl.size; a.dispersed = pl.type == 1; a.numSubslices = pl.numSubslices; a.subsliceInterval = pl.subsliceInterval;
-        if (bicm.ok() && pl.tiMode == 0 && pl.layer == 0 && a.size > 0) {
+        if (bicm.ok() && pl.tiMode == 1 && pl.layer == 0 && a.size > 0) {
+            pr.cti = true;
+            pr.cfg = fp;
+            pr.ctiRows = ctiRows(pl.ctiDepth, pl.tiExtendedInterleaving != 0);
+            pr.ctiStartRow = pl.ctiStartRow; pr.ctiFecBlockStart = pl.ctiFecBlockStart;
+            pr.cells.resize((size_t)a.size);
+            double nsum = 0;
+            for (int i = 0; i < a.size; i++) {
+                long idx = plpCellIndex(a, i);
+                pr.cells[(size_t)i] = idx >= 0 && idx < (long)all.size() ? all[(size_t)idx] : cf32(0, 0);
+                nsum += idx >= 0 && idx < (long)noise.size() ? noise[(size_t)idx] : 0;
+            }
+            pr.noise = (float)std::max(nsum / a.size, 0.002);
+        } else if (bicm.ok() && pl.tiMode == 0 && pl.layer == 0 && a.size > 0) {
             const int cb = bicm.cells();
             pr.blocks = a.size / cb;
             for (int b = 0; b < pr.blocks; b++) {
