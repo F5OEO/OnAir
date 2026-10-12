@@ -324,8 +324,13 @@ void Bicm::decodeBatch(const std::vector<const cf32*>& cells, float noiseVar, st
     // the values are the limited LLRs rounded to integers (+-20): with the 8-bit range filled to +-31 the decoder failed on 1.5% of the blocks, which
     // the float decoder then had to take over
     code.decodeBatch(ptr, 20, hard, good);
+    // A block the 8-bit decoder gave up on may still decode with the float one (60 iterations). When most blocks of the batch fail it is a damaged
+    // frame (a gap in the samples): the float decoder would spend about 150 ms on each and keep the whole receiver waiting for many seconds.
+    int failed = 0;
+    for (int b = 0; b < nb; b++) failed += !good[(size_t)b];
+    const bool retry = failed * 4 <= nb;
     for (int b = 0; b < nb; b++) {
-        if (!good[(size_t)b]) {   // the 8-bit decoder gave up: the float one has the whole 60 iterations
+        if (!good[(size_t)b] && retry) {   // the 8-bit decoder gave up: the float one has the whole 60 iterations
             llrs(cells[(size_t)b], noiseVar, llr);
             good[(size_t)b] = code.decode(llr, 60, hard[(size_t)b]);
         }
