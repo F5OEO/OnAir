@@ -122,6 +122,10 @@ int main(int argc, char** argv) {
         Params p; p.mode = 2; p.guard = kGi16; p.partial = true; p.layer[0] = L(1, kQpsk, kR12, 2); p.layer[1] = L(12, k16Qam, kR23, 1);
         cases.push_back({"mode 2, partial + 12 seg, 8 Msps, CFO -5.1 kHz", p, 22, 8e6, -5100, 25, 0, 0, 0});
     }
+    {   // a transmitter whose bit interleaving delay adjustment is two symbols: the receiver finds the other alignment after a run of failures
+        Params p; p.mode = 1; p.guard = kGi8; p.bitDelayTwoSymbols = true; p.layer[0] = L(13, k16Qam, kR34, 1);
+        cases.push_back({"mode 1, 13 seg 16QAM 3/4, bit delay of two symbols", p, 30, 8e6, 1500, 28, 0, 0, 0});
+    }
     if (!quick) {
         {
             Params p; p.mode = 3; p.guard = kGi8; p.layer[0] = L(13, k64Qam, kR23);

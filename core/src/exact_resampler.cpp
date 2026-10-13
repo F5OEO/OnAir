@@ -110,13 +110,14 @@ size_t resampleLoopAvx2(const float* R, const float* M, const float* B, int stri
 }
 #endif
 
+}
+
 size_t resampleLoop(const float* R, const float* M, const float* B, int stride, int phases, int hm1, long avail, double& pos, double step, cf32* o) {
 #ifdef DECT2_ER_AVX2
     static const bool avx2 = __builtin_cpu_supports("avx2");
     if (avx2) return resampleLoopAvx2(R, M, B, stride, phases, hm1, avail, pos, step, o);
 #endif
     return resampleLoopPortable(R, M, B, stride, phases, hm1, avail, pos, step, o);
-}
 }
 
 void ExactResampler::process(const cf32* in, size_t n, std::vector<cf32>& out) {

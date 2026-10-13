@@ -168,10 +168,7 @@ Poly82 powerMod(int e) {
 // syndrome contribution of bit position j (0 = B20 ... 183 = B203) of the 184-bit word: x^(183 - j) mod g
 const Poly82* unitSyndromes() {
     static Poly82 tab[184];
-    static bool done = false;
-    static std::mutex mu;
-    std::lock_guard<std::mutex> lk(mu);
-    if (!done) {
+    static const bool done = [] {   // built once, thread safe, and no lock on the calls after it
         Poly82 cur = powerMod(0);
         Poly82 g;
         for (int x : kGenExp) if (x < 82) flipBit(g, x);
@@ -183,8 +180,9 @@ const Poly82* unitSyndromes() {
             cur.hi &= (1ull << 18) - 1;
             if (top) { cur.lo ^= g.lo; cur.hi ^= g.hi; }
         }
-        done = true;
-    }
+        return true;
+    }();
+    (void)done;
     return tab;
 }
 
@@ -209,7 +207,7 @@ void tmccParity(const uint8_t info[kTmccInfoBits], uint8_t parity[82]) {
 bool tmccValid(const uint8_t bits184[184]) { return zero(syndromeOf(bits184)); }
 
 bool tmccCorrect(uint8_t bits[184], const float* reliability) {
-    Poly82 s = syndromeOf(bits);
+    const Poly82 s = syndromeOf(bits);
     if (zero(s)) return true;
     const Poly82* t = unitSyndromes();
     // the least reliable positions
@@ -217,22 +215,48 @@ bool tmccCorrect(uint8_t bits[184], const float* reliability) {
     int idx[184];
     for (int i = 0; i < 184; i++) idx[i] = i;
     std::partial_sort(idx, idx + kN, idx + 184, [&](int a, int b) { return reliability[a] < reliability[b]; });
-    // up to four flips among the kN least reliable bits (about 4000 combinations)
-    int sel[4];
-    std::function<bool(int, int, int, Poly82)> rec = [&](int depth, int want, int from, Poly82 acc) -> bool {
-        if (depth == want) return zero(acc);
-        for (int i = from; i < kN; i++) {
-            sel[depth] = i;
-            Poly82 a2 = acc;
-            a2.lo ^= t[idx[i]].lo; a2.hi ^= t[idx[i]].hi;
-            if (rec(depth + 1, want, i + 1, a2)) return true;
+    // Up to four flips among the kN least reliable bits (about 4000 combinations), found by meeting in the middle: the syndromes of all the sets of
+    // at most two of them go in a small hash table, and for each set B the table is asked for the set A whose syndrome is s ^ B. The receiver calls
+    // this for every candidate while it looks for the frame, so it has to be cheap.
+    struct Sub { Poly82 syn; int8_t a, b; };   // the positions in idx (-1: none)
+    constexpr int kSubs = 1 + kN + kN * (kN - 1) / 2;
+    Sub sub[kSubs];
+    int ns = 0;
+    sub[ns++] = Sub{Poly82(), -1, -1};
+    for (int i = 0; i < kN; i++) sub[ns++] = Sub{t[idx[i]], (int8_t)i, -1};
+    for (int i = 0; i < kN; i++)
+        for (int j = i + 1; j < kN; j++) {
+            Poly82 p = t[idx[i]];
+            p.lo ^= t[idx[j]].lo; p.hi ^= t[idx[j]].hi;
+            sub[ns++] = Sub{p, (int8_t)i, (int8_t)j};
         }
-        return false;
-    };
-    for (int n = 1; n <= 4; n++) {
-        if (rec(0, n, 0, s)) { for (int k = 0; k < n; k++) bits[idx[sel[k]]] ^= 1; return true; }
+    constexpr int kH = 512;
+    int16_t slot[kH];
+    for (int i = 0; i < kH; i++) slot[i] = -1;
+    auto hash = [](const Poly82& p) { return (unsigned)(((p.lo ^ (p.hi * 0x9E3779B97F4A7C15ull)) * 0xD6E8FEB86659FD93ull) >> 55); };
+    for (int i = 0; i < ns; i++) {   // the smaller sets come first and stay when two have the same syndrome
+        unsigned h = hash(sub[i].syn);
+        bool dup = false;
+        while (slot[h] >= 0) { if (sub[slot[h]].syn.lo == sub[i].syn.lo && sub[slot[h]].syn.hi == sub[i].syn.hi) { dup = true; break; } h = (h + 1) & (kH - 1); }
+        if (!dup) slot[h] = (int16_t)i;
     }
-    return false;
+    auto count = [](const Sub& x) { return (x.a >= 0) + (x.b >= 0); };
+    int best = -1, bestA = -1, bestN = 99;
+    for (int i = 0; i < ns; i++) {
+        Poly82 key = s;
+        key.lo ^= sub[i].syn.lo; key.hi ^= sub[i].syn.hi;
+        unsigned h = hash(key);
+        while (slot[h] >= 0 && !(sub[slot[h]].syn.lo == key.lo && sub[slot[h]].syn.hi == key.hi)) h = (h + 1) & (kH - 1);
+        if (slot[h] < 0) continue;
+        const Sub& A = sub[slot[h]];
+        const Sub& B = sub[i];
+        const bool overlap = (A.a >= 0 && (A.a == B.a || A.a == B.b)) || (A.b >= 0 && (A.b == B.a || A.b == B.b));
+        const int n = count(A) + count(B);
+        if (!overlap && n > 0 && n < bestN) { bestN = n; best = i; bestA = slot[h]; }
+    }
+    if (best < 0) return false;
+    for (int k : {sub[best].a, sub[best].b, sub[bestA].a, sub[bestA].b}) if (k >= 0) bits[idx[k]] ^= 1;
+    return true;
 }
 
 namespace {
@@ -388,6 +412,50 @@ void demapCell(int mod, cf32 z, float n0, float* llr) {
         llr[2 + axis] = (d1b - d0b) * n2 * inv;
         llr[4 + axis] = (d1c - d0c) * n2 * inv;
     }
+}
+
+namespace {
+// The same max-log decisions as demapCell, with the constants folded and no libm call (the level of the 64-QAM axis is a clamped integer cast).
+template <int Mod>
+inline void demapAxis(float x, float inv, float* llr, int stride) {
+    if constexpr (Mod == kQpsk) {
+        llr[0] = 4.f * 0.70710678f * x * inv;
+    } else if constexpr (Mod == k16Qam) {
+        constexpr float n = 0.31622777f, n2 = 0.1f, rn = 1.f / n;
+        const float u = x * rn;
+        const float dpos = std::min(sq(u - 1.f), sq(u - 3.f)), dneg = std::min(sq(u + 1.f), sq(u + 3.f));
+        const float a = std::fabs(u);
+        llr[0] = (dneg - dpos) * n2 * inv;
+        llr[stride] = (sq(a - 1.f) - sq(a - 3.f)) * n2 * inv;
+    } else {
+        constexpr float n = 0.15430335f, n2 = 1.f / 42.f, rn = 1.f / n;
+        const float u = x * rn, a = std::fabs(u);
+        // nearest positive level of {1, 3, 5, 7} on each side: 2 * floor(v / 2) + 1 clamped, and for v < 0 the clamp gives 1 as a truncation does
+        auto lvl = [](float v) { v *= 0.5f; v = !(v >= 0.f) ? 0.f : v > 3.f ? 3.f : v; return 2.f * (float)(int)v + 1.f; };
+        const float dpos = sq(u - lvl(u)), dneg = sq(u + lvl(-u));
+        const float d0b = std::min(sq(a - 5.f), sq(a - 7.f)), d1b = std::min(sq(a - 1.f), sq(a - 3.f));
+        const float d0c = std::min(sq(a - 1.f), sq(a - 7.f)), d1c = std::min(sq(a - 3.f), sq(a - 5.f));
+        llr[0] = (dneg - dpos) * n2 * inv;
+        llr[stride] = (d1b - d0b) * n2 * inv;
+        llr[2 * stride] = (d1c - d0c) * n2 * inv;
+    }
+}
+template <int Mod>
+void demapRun(const cf32* z, const float* n0, int nc, float* llr) {
+    constexpr int m = Mod == kQpsk ? 2 : Mod == k16Qam ? 4 : 6;
+    for (int c = 0; c < nc; c++) {
+        const float inv = 1.f / std::max(n0[c], 1e-12f);
+        float* o = llr + (size_t)c * m;
+        demapAxis<Mod>(z[c].real(), inv, o, 2);
+        demapAxis<Mod>(z[c].imag(), inv, o + 1, 2);
+    }
+}
+}
+
+void demapCells(int mod, const cf32* z, const float* n0, int nc, float* llr) {
+    if (mod == kQpsk || mod == kDqpsk) demapRun<kQpsk>(z, n0, nc, llr);
+    else if (mod == k16Qam) demapRun<k16Qam>(z, n0, nc, llr);
+    else demapRun<k64Qam>(z, n0, nc, llr);
 }
 
 void demapCellGeneric(int mod, cf32 z, float n0, float* llr) {

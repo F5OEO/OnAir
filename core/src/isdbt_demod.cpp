@@ -6,7 +6,9 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <deque>
+#include <mutex>
 #include <thread>
 
 namespace dect2 {
@@ -14,13 +16,14 @@ namespace isdbt {
 
 namespace {
 const int kBranchDelay[4][6] = {{0, 120, 0, 0, 0, 0}, {0, 120, 0, 0, 0, 0}, {0, 40, 80, 120, 0, 0}, {0, 24, 48, 72, 96, 120}};
+constexpr int kSwitchAfter = 64;   // packets in a row that fail before the other alignment is tried
 constexpr float kErasure = 1e9f;   // noise variance given to cells that have not been received
 constexpr double kNoiseCal = 1.0;  // correction of the pilot-based noise estimate (calibrated against simulations)
 
 struct Prbs {
     unsigned r = 0;
-    void reset() { r = 0; for (int i = 0; i < 15; i++) r = (r << 1) | (unsigned)("100101010000000"[i] - '0'); }
-    unsigned bit() { const unsigned b = ((r >> 14) ^ (r >> 13)) & 1; r = ((r << 1) | b) & 0x7FFF; return b; }
+    void reset() { r = 0x4A80; }
+    unsigned bit() { const unsigned b = (r ^ (r >> 1)) & 1; r = (r >> 1) | (b << 14); return b; }
 };
 }
 
@@ -33,6 +36,13 @@ struct LayerDecoder {
     std::vector<std::vector<float>> ring;
     std::vector<size_t> ringPos;
     long skipCells = 120;
+    bool twoSymbols = false;        // which delay adjustment the transmitter uses for the bit interleaving; flipped after a long run of failures
+    bool restart = false;
+    bool modelKnown = false;        // packets have decoded with this alignment: failures after that are the channel's (a dropped stretch of signal, a retune), not a different transmitter model
+    bool anyGood = false;           // a packet has decoded since the last configure
+    int goodRun = 0;
+    bool waitFrame = false;         // after a restart: the layer begins again at the next frame
+    long holdoff = 0;               // symbols before failures count: the time de-interleaver is still filling with erasures
     std::vector<float> llrQ;
     std::vector<int8_t> carry;
     std::vector<uint8_t> bits;
@@ -50,35 +60,68 @@ struct LayerDecoder {
 
     void configure(int mode_, const Layer& l) {
         cfg = l; mode = mode_;
+        if (!anyGood) modelKnown = false;   // the last lock decoded nothing: a different transmitter, perhaps
+        anyGood = false;
         nc = dataPerSegment(mode) * l.segments;
         K = packetsPerFrame(mode, l);
         m = bitsPerCell(l.mod);
         ring.assign((size_t)m, {});
         ringPos.assign((size_t)m, 0);
         for (int r = 0; r < m; r++) ring[(size_t)r].assign((size_t)(120 - kBranchDelay[l.mod][r]), 0.f);
-        skipCells = 2 * nc;      // the bit interleaving (with its delay adjustment) takes two symbols
+        skipCells = twoSymbols ? 2 * nc : 0;   // the bit interleaving with its delay adjustment takes a whole frame or, in the other model, two symbols
         llrQ.clear(); carry.clear(); bits.clear(); byteQ.clear(); out.clear(); merged.clear(); block.clear();
         deint = dvbt::ConvInterleaver(true);
         t = u = 0; packetsOut = 0; failStreak = 0;
         st = LayerStats();
+        restart = false;
+        goodRun = 0;
+        holdoff = 95L * interleavingLength(mode, cfg.ti) + timeInterleaveAdjust(mode, cfg.ti) + 4 * kSymbolsPerFrame;   // the interleavers, the bit delay and the byte delay fill up one after the other
     }
 
-    void pushSymbol(const cf32* cells, const float* n0) {
-        float llr[6];
-        for (int c = 0; c < nc; c++) {
-            demapCell(cfg.mod == kDqpsk ? kQpsk : cfg.mod, cells[c], n0[c], llr);
-            for (int r = 0; r < m; r++) {
-                auto& rg = ring[(size_t)r];
-                float o = llr[r];
-                if (!rg.empty()) { o = rg[ringPos[(size_t)r]]; rg[ringPos[(size_t)r]] = llr[r]; if (++ringPos[(size_t)r] == rg.size()) ringPos[(size_t)r] = 0; }
-                if (skipCells > 0) continue;
-                llrQ.push_back(o);
+    // Every packet failed for a while: the other bit interleaving delay adjustment may be the one in use. Starts the layer over with it (statistics and
+    // the packet position are kept).
+    void switchModel() {
+        const LayerStats keep = st;
+        const uint64_t pos = packetsOut;
+        twoSymbols = !twoSymbols;
+        configure(mode, cfg);
+        st = keep;
+        packetsOut = pos;
+        waitFrame = true;
+        holdoff = 0;
+        modelKnown = false;
+    }
+
+    std::vector<float> symLlr;      // the bit values of one symbol, m per cell
+
+    void pushSymbol(const cf32* cells, const float* n0, int symIdx) {
+        if (waitFrame) { if (symIdx != 0) return; waitFrame = false; }
+        if (holdoff > 0) holdoff--;
+        symLlr.resize((size_t)nc * (size_t)m);
+        demapCells(cfg.mod == kDqpsk ? kQpsk : cfg.mod, cells, n0, nc, symLlr.data());
+        // the delay of each bit branch (the bit interleaving), then the cells in order
+        const int skip = (int)std::min<long>(skipCells, nc);
+        for (int r = 0; r < m; r++) {
+            auto& rg = ring[(size_t)r];
+            size_t pos = ringPos[(size_t)r];
+            const size_t len = rg.size();
+            float* d = symLlr.data() + r;
+            if (len) {
+                for (int c = 0; c < nc; c++) {
+                    const float o = rg[pos];
+                    rg[pos] = d[(size_t)c * m];
+                    d[(size_t)c * m] = o;
+                    if (++pos == len) pos = 0;
+                }
+                ringPos[(size_t)r] = pos;
             }
-            if (skipCells > 0) skipCells--;
         }
+        if (skip < nc) llrQ.insert(llrQ.end(), symLlr.begin() + (long)skip * m, symLlr.end());
+        skipCells -= skip;
         const size_t frameBits = (size_t)kSymbolsPerFrame * nc * m;
         while (llrQ.size() >= frameBits) {
             processFrame(llrQ.data(), frameBits);
+            if (restart) { switchModel(); break; }
             llrQ.erase(llrQ.begin(), llrQ.begin() + (long)frameBits);
         }
     }
@@ -123,7 +166,7 @@ struct LayerDecoder {
             if (!sync) b ^= (uint8_t)x;
             if (u >= 203) {
                 block.push_back(b);
-                if (block.size() == 204) { finishBlock(); block.clear(); }
+                if (block.size() == 204) { finishBlock(); block.clear(); if (restart) return; }
             }
             u++;
         }
@@ -135,8 +178,8 @@ struct LayerDecoder {
         st.packets++;
         uint8_t pkt[188];
         std::memcpy(pkt, block.data(), 188);
-        if (r < 0) { st.rsFailed++; pkt[1] |= 0x80; failStreak++; }
-        else { if (r == 0) st.rsClean++; else st.rsCorrected++; failStreak = 0; }
+        if (r < 0) { st.rsFailed++; pkt[1] |= 0x80; goodRun = 0; ++failStreak; if (failStreak >= kSwitchAfter && !modelKnown && holdoff <= 0) restart = true; }
+        else { if (r == 0) st.rsClean++; else st.rsCorrected++; failStreak = 0; anyGood = true; if (++goodRun >= 32) modelKnown = true; }
         st.synced = failStreak < 8 && (r >= 0 || syncOk);
         out.insert(out.end(), pkt, pkt + 188);
         packetsOut++;
@@ -181,11 +224,104 @@ struct Demod::Impl {
     std::vector<size_t> tiPos;
     std::vector<double> mergedLastFrac;
 
+    // ---- the layer decoders (demapping, de-interleaving, Viterbi, Reed-Solomon) run on a worker thread of their own, one symbol per job in
+    // order; the front end above hands over the cells and goes on. What the receiver reads (packets, merged packets, statistics) is what the
+    // worker has published after each job. DECT2_ISDBT_THREADS=0 runs the jobs in the calling thread instead.
+    struct Job { std::vector<cf32> cells[3]; std::vector<float> nn[3]; int symIdx = 0; };
+    struct Published { std::vector<uint8_t> out; std::deque<std::pair<double, std::vector<uint8_t>>> merged; uint64_t packetsOut = 0; int K = 1; LayerStats st; };
+    static constexpr size_t kKeepOut = 16u << 20;   // bytes of per-layer packets kept for takePackets()
+    static constexpr size_t kJobs = 256;    // more than a frame's burst of decoding (about 30 symbols) needs
+    std::vector<Job> jobs;
+    size_t produced = 0, consumed = 0;      // jobs handed over / finished (guarded by qm)
+    std::mutex qm;
+    std::condition_variable cvWork, cvSpace;
+    bool stopWorker = false;
+    std::thread worker;
+    bool threaded = true;
+    int ncOf[3] = {0, 0, 0};                // cells per symbol of each layer (the front end's copy: the worker owns layer[])
+    bool usedL[3] = {false, false, false};
+    std::mutex mu;                          // guards pub
+    Published pub[3];
+    mutable LayerStats statSnap[3];
+    std::vector<uint8_t> carryOut;          // merged packets released by a reconfiguration, for the next takeMerged
+    size_t mergeInto(std::vector<uint8_t>& out);
+
+    Impl() {
+        const char* e = getenv("DECT2_ISDBT_THREADS");
+        threaded = !(e && e[0] == '0') && std::thread::hardware_concurrency() > 1;
+    }
+    ~Impl() {
+        if (worker.joinable()) { { std::lock_guard<std::mutex> g(qm); stopWorker = true; } cvWork.notify_all(); worker.join(); }
+    }
+    void publish() {
+        std::lock_guard<std::mutex> g(mu);
+        for (int li = 0; li < 3; li++) {
+            if (!usedL[li]) continue;
+            LayerDecoder& l = layer[li];
+            Published& P = pub[li];
+            P.out.insert(P.out.end(), l.out.begin(), l.out.end());
+            l.out.clear();
+            // only the merged output is read by the receiver: keep the per-layer packets for takePackets() within a bound, not for ever
+            if (P.out.size() > kKeepOut) P.out.erase(P.out.begin(), P.out.begin() + (long)((P.out.size() - kKeepOut / 2) / 188 * 188));
+            for (auto& m : l.merged) P.merged.push_back(std::move(m));
+            l.merged.clear();
+            P.packetsOut = l.packetsOut; P.K = l.K; P.st = l.st;
+        }
+    }
+    void runJob(Job& j) {
+        for (int li = 0; li < 3; li++) if (usedL[li]) layer[li].pushSymbol(j.cells[li].data(), j.nn[li].data(), j.symIdx);
+        publish();
+    }
+    void workerLoop() {
+        std::unique_lock<std::mutex> lk(qm);
+        for (;;) {
+            cvWork.wait(lk, [&] { return stopWorker || consumed != produced; });
+            if (consumed == produced) return;   // stopping, and nothing is left
+            Job& j = jobs[consumed % kJobs];
+            lk.unlock();
+            runJob(j);
+            lk.lock();
+            consumed++;
+            cvSpace.notify_all();
+        }
+    }
+    Job& acquire() {   // a free job slot to fill
+        if (jobs.empty()) jobs.resize(kJobs);
+        if (threaded) {
+            std::unique_lock<std::mutex> lk(qm);
+            cvSpace.wait(lk, [&] { return produced - consumed < kJobs; });
+        }
+        return jobs[produced % kJobs];
+    }
+    void submit(Job& j) {
+        if (!threaded) { runJob(j); produced++; consumed++; return; }
+        {
+            std::lock_guard<std::mutex> g(qm);
+            if (!worker.joinable()) worker = std::thread([this] { workerLoop(); });
+            produced++;
+        }
+        cvWork.notify_one();
+    }
+    void drain() {   // everything handed over is decoded and published
+        if (!threaded) return;
+        std::unique_lock<std::mutex> lk(qm);
+        cvSpace.wait(lk, [&] { return consumed == produced; });
+    }
+
     void configure(const Params& pp) {
+        drain();   // the worker is idle from here on
+        mergeInto(carryOut);   // what the receiver would already have taken before the layers start again
         p = pp; mode = p.mode;
         cps = carriersPerSegment(mode); dps = dataPerSegment(mode); K = totalCarriers(mode); N = fftN(mode);
         segmentLayout(p, seg);
-        for (int i = 0; i < 3; i++) if (p.layer[i].used()) layer[i].configure(mode, p.layer[i]); else layer[i] = LayerDecoder();
+        for (int i = 0; i < 3; i++) {
+            if (p.layer[i].used()) layer[i].configure(mode, p.layer[i]); else layer[i] = LayerDecoder();
+            usedL[i] = p.layer[i].used();
+            ncOf[i] = layer[i].nc;
+            std::lock_guard<std::mutex> g(mu);
+            pub[i] = Published();
+            pub[i].K = layer[i].K;
+        }
         haveTmcc = false;
         tmccCar.clear();
         for (int pos = 0; pos < kSegments; pos++) {
@@ -312,7 +448,6 @@ struct Demod::Impl {
             const double det = Sw * Sxx - Sx * Sx;
             if (pts.size() >= 6 && det > 1e-12 * Sw * Sw) { dSlope = (Sw * Sxy - Sx * Sy) / det; dPhi = phi0 + (Sy - dSlope * Sx) / Sw; }
             accPhi += dPhi; accSlope += dSlope;
-            if (getenv("ISDBT_DEBUG3") && symbols > 100 && symbols < 118) fprintf(stderr, "[track] sym %llu pts %zu dPhi %.4f dSlope %.3g accSlope %.4f (per symbol %.3g) accPhi %.2f\n", (unsigned long long)symbols, pts.size(), dPhi, dSlope, accSlope, accSlope / std::max<uint64_t>(1, symbols), accPhi);
         }
         Yd.resize((size_t)K);
         for (int k = 0; k < K; k++) { const double a = -(accPhi + accSlope * (double)(k - kc)); Yd[(size_t)k] = Yraw[k] * cf32((float)std::cos(a), (float)std::sin(a)); }
@@ -481,9 +616,11 @@ struct Demod::Impl {
         // time de-interleaving and assembling the layers' cell vectors
         int firstSeg[3] = {0, 0, 0};
         for (int s = kSegments - 1; s >= 0; s--) if (seg[s].layer >= 0) firstSeg[seg[s].layer] = s;
-        std::vector<cf32> cells[3];
-        std::vector<float> nn[3];
-        for (int li = 0; li < 3; li++) if (p.layer[li].used()) { cells[li].assign((size_t)layer[li].nc, cf32(0, 0)); nn[li].assign((size_t)layer[li].nc, kErasure); }
+        Job& job = acquire();
+        std::vector<cf32>* cells = job.cells;
+        std::vector<float>* nn = job.nn;
+        job.symIdx = symIdx;
+        for (int li = 0; li < 3; li++) if (p.layer[li].used()) { cells[li].assign((size_t)ncOf[li], cf32(0, 0)); nn[li].assign((size_t)ncOf[li], kErasure); }
         for (int s = 0; s < kSegments; s++) {
             if (seg[s].layer < 0) continue;
             const int li = seg[s].layer, local = s - firstSeg[li];
@@ -503,7 +640,7 @@ struct Demod::Impl {
                 nn[li][(size_t)local * dps + (size_t)i] = x;
             }
         }
-        if (started) for (int li = 0; li < 3; li++) if (p.layer[li].used()) layer[li].pushSymbol(cells[li].data(), nn[li].data());
+        if (started) submit(job);
         if (symbols % 8 == 0) {
             eq.clear();
             for (int s = 0; s < kSegments; s++) if (!val[(size_t)s].empty() && !seg[s].diff) for (int i = 0; i < dps; i += 4) if (nv[(size_t)s][(size_t)i] < 1e6f) eq.push_back(val[(size_t)s][(size_t)i]);
@@ -524,17 +661,19 @@ void Demod::setTmccInfo(const uint8_t info[kTmccInfoBits]) {
 void Demod::pushSymbol(const cf32* Y, int symIdx) { impl_->pushSymbol(Y, symIdx); }
 void Demod::setDelayCentre(double tau0) { impl_->tau0 = tau0; }
 void Demod::takePackets(int layer, std::vector<uint8_t>& out) {
-    auto& l = impl_->layer[layer];
+    std::lock_guard<std::mutex> g(impl_->mu);
+    auto& l = impl_->pub[layer];
     out.insert(out.end(), l.out.begin(), l.out.end());
     l.out.clear();
 }
-size_t Demod::takeMerged(std::vector<uint8_t>& out) {
-    Impl& I = *impl_;
+size_t Demod::Impl::mergeInto(std::vector<uint8_t>& out) {
+    Impl& I = *this;
+    std::lock_guard<std::mutex> g(I.mu);
     // all layers' packets up to the time the slowest active layer has reached
     double watermark = 1e30;
     bool any = false;
     for (int li = 0; li < 3; li++) {
-        auto& l = I.layer[li];
+        auto& l = I.pub[li];
         if (!I.p.layer[li].used()) continue;
         any = true;
         if (l.merged.empty()) { watermark = std::min(watermark, l.packetsOut == 0 ? 0.0 : (double)l.packetsOut / std::max(1, l.K)); }
@@ -543,26 +682,37 @@ size_t Demod::takeMerged(std::vector<uint8_t>& out) {
     if (!any) return 0;
     // a layer that has not produced anything for a long time must not hold the others back
     double maxFrac = 0;
-    for (int li = 0; li < 3; li++) if (I.p.layer[li].used() && !I.layer[li].merged.empty()) maxFrac = std::max(maxFrac, I.layer[li].merged.back().first);
+    for (int li = 0; li < 3; li++) if (I.p.layer[li].used() && !I.pub[li].merged.empty()) maxFrac = std::max(maxFrac, I.pub[li].merged.back().first);
     if (maxFrac - watermark > 3.0) watermark = maxFrac - 3.0;
     size_t n = 0;
     for (;;) {
         int best = -1;
         double bf = 1e30;
         for (int li = 0; li < 3; li++) {
-            auto& l = I.layer[li];
+            auto& l = I.pub[li];
             if (!I.p.layer[li].used() || l.merged.empty()) continue;
             if (l.merged.front().first <= watermark && l.merged.front().first < bf) { bf = l.merged.front().first; best = li; }
         }
         if (best < 0) break;
-        auto& l = I.layer[best];
+        auto& l = I.pub[best];
         out.insert(out.end(), l.merged.front().second.begin(), l.merged.front().second.end());
         l.merged.pop_front();
         n++;
     }
     return n;
 }
-const LayerStats& Demod::layerStats(int layer) const { return impl_->layer[layer].st; }
+size_t Demod::takeMerged(std::vector<uint8_t>& out) {
+    Impl& I = *impl_;
+    size_t n = I.carryOut.size() / 188;
+    out.insert(out.end(), I.carryOut.begin(), I.carryOut.end());
+    I.carryOut.clear();
+    return n + I.mergeInto(out);
+}
+const LayerStats& Demod::layerStats(int layer) const {
+    std::lock_guard<std::mutex> g(impl_->mu);
+    impl_->statSnap[layer] = impl_->pub[layer].st;
+    return impl_->statSnap[layer];
+}
 double Demod::noiseVariance() const { return impl_->sigma2; }
 double Demod::snrDb() const { return impl_->snr; }
 const std::vector<cf32>& Demod::eqCells() const { return impl_->eq; }

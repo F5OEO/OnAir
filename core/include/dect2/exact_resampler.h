@@ -6,6 +6,11 @@
 
 namespace dect2 {
 
+// The resampling loop shared by the resamplers: one windowed-sinc dot product per output sample (AVX2 where the CPU has it). R and M are the
+// real and imaginary input rows, B the filter bank ((phases + 1) rows of stride taps, stride a multiple of 8), pos the position of the next output
+// in input samples (not negative); writes to o, which must have room, and returns the count.
+size_t resampleLoop(const float* R, const float* M, const float* B, int stride, int phases, int hm1, long avail, double& pos, double step, cf32* o);
+
 class ExactResampler {
 public:
     // Returns false for ratios the filter cannot do (the output rate must not exceed about 4 times the input rate).

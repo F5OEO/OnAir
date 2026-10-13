@@ -41,6 +41,7 @@ struct Params {
     int guard = kGi8;
     bool partial = false;         // segment 0 is a partial-reception (one-segment) layer: it is layer A and has one segment
     Layer layer[3];               // A, B, C: consecutive segment numbers, ascending
+    bool bitDelayTwoSymbols = false;   // transmitter model only: the bit interleaving delay adjustment makes the whole delay two OFDM symbols (the default makes it a whole frame, as the recorded transmitters do); the receiver follows either
     int bwMhz = 6;                // channel width 6, 7 or 8 MHz: scales only the rates and durations (not compared, not signalled)
     int totalSegments() const { return layer[0].segments + layer[1].segments + layer[2].segments; }
     bool operator==(const Params& o) const { return mode == o.mode && guard == o.guard && partial == o.partial && layer[0] == o.layer[0] && layer[1] == o.layer[1] && layer[2] == o.layer[2]; }
@@ -131,6 +132,8 @@ cf32 mapLabel(int mod, unsigned label);
 // Bit LLRs for one cell (llr > 0: bit 0), n0: noise variance of the cell; b0 first
 void demapCell(int mod, cf32 z, float n0, float* llr);
 // The same by comparing with every point (reference for the tests)
+// The cells of a symbol at once: bits per cell values for each, in the order of demapCell.
+void demapCells(int mod, const cf32* z, const float* n0, int nc, float* llr);
 void demapCellGeneric(int mod, cf32 z, float n0, float* llr);
 
 // ---- the tables (generated from the standard)

@@ -10,11 +10,12 @@ namespace isdbt {
 namespace {
 const int kBranchDelay[4][6] = {{0, 120, 0, 0, 0, 0}, {0, 120, 0, 0, 0, 0}, {0, 40, 80, 120, 0, 0}, {0, 24, 48, 72, 96, 120}};   // by Mod: DQPSK, QPSK, 16QAM, 64QAM
 
-// energy dispersal: 1 + x^14 + x^15, started with 100101010000000 (the first bit is the oldest)
+// energy dispersal: 1 + x^14 + x^15, started with 100101010000000 loaded into stages 1..15 (the output is stage 14 xor stage 15, and it feeds
+// stage 1, so the last bit of the start value is the oldest): the same sequence as DVB-T, which begins 03 F6 08 34 30 B8 A3 93
 struct Prbs {
     unsigned r = 0;
-    void reset() { r = 0; for (int i = 0; i < 15; i++) r = (r << 1) | (unsigned)("100101010000000"[i] - '0'); }
-    unsigned bit() { const unsigned b = ((r >> 14) ^ (r >> 13)) & 1; r = ((r << 1) | b) & 0x7FFF; return b; }
+    void reset() { r = 0x4A80; }
+    unsigned bit() { const unsigned b = (r ^ (r >> 1)) & 1; r = (r >> 1) | (b << 14); return b; }
 };
 }
 
@@ -80,15 +81,15 @@ struct Generator::LayerTx {
     std::vector<std::vector<uint8_t>> ring;   // delay of every bit branch before the mapper, oldest first
     std::vector<cf32> dq;      // DQPSK reference of every cell position
     std::vector<uint8_t> byteDelay;   // delay adjustment before byte interleaving: K - 11 packets
-    std::vector<uint8_t> bitDelay;    // delay adjustment before bit interleaving: two symbols minus the 120 cells of the interleaver
+    std::vector<uint8_t> bitDelay;    // delay adjustment before bit interleaving: with the 120 cells of the interleaver, a whole frame (or two symbols)
     std::vector<cf32> symDelay;       // delay adjustment before time interleaving, whole symbols
     std::vector<uint8_t> prbsSeq;     // energy dispersal sequence of one frame, zero where the synchronisation byte sits
     std::vector<cf32> lut;            // constellation by bit label
     std::vector<uint8_t> rs, shifted, il, bits, coded;   // scratch
-    LayerTx(int mode_, const Layer& l) : cfg(l), mode(mode_), nc(dataPerSegment(mode_) * l.segments), packets(packetsPerFrame(mode_, l)), enc(l.rate), dq((size_t)nc, cf32(1, 0)) {
+    LayerTx(int mode_, const Layer& l, bool twoSymbols) : cfg(l), mode(mode_), nc(dataPerSegment(mode_) * l.segments), packets(packetsPerFrame(mode_, l)), enc(l.rate), dq((size_t)nc, cf32(1, 0)) {
         const int m = bitsPerCell(l.mod);
         byteDelay.assign((size_t)std::max(0, packets - 11) * 204, 0);
-        bitDelay.assign((size_t)(2 * nc - 120) * (size_t)m, 0);
+        bitDelay.assign((size_t)((twoSymbols ? 2 : kSymbolsPerFrame) * nc - 120) * (size_t)m, 0);
         symDelay.assign((size_t)timeInterleaveAdjust(mode_, l.ti) * (size_t)nc, cf32(0, 0));
         ring.resize((size_t)m);
         for (int r = 0; r < m; r++) ring[(size_t)r].assign((size_t)kBranchDelay[l.mod][r], 0);
@@ -182,7 +183,7 @@ struct Generator::Plan {
 Generator::Generator(const Params& p, PacketSource src, unsigned) : p_(p), N_(fftN(p.mode)), G_(guardSamples(p.mode, p.guard)), K_(totalCarriers(p.mode)), src_(std::move(src)) {
     if (!src_) src_ = countingSource();
     segmentLayout(p_, seg_);
-    for (int i = 0; i < 3; i++) tx_.emplace_back(p_.layer[i].used() ? new LayerTx(p.mode, p_.layer[i]) : nullptr);
+    for (int i = 0; i < 3; i++) tx_.emplace_back(p_.layer[i].used() ? new LayerTx(p.mode, p_.layer[i], p.bitDelayTwoSymbols) : nullptr);
     const int dps = dataPerSegment(p.mode);
     fifo_.resize((size_t)kSegments * (size_t)dps);
     fifoPos_.assign(fifo_.size(), 0);

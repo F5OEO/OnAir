@@ -2,6 +2,7 @@
 // The ISDB-T signal fills 5.6 MHz of the 8.13 MHz input band, so a short filter (24 taps per phase) is enough; the exact phases come from
 // integer arithmetic, no per-sample position tracking.
 #pragma once
+#include "dect2/exact_resampler.h"
 #include "dect2/gen_util.h"
 #include "ring.h"
 #include <algorithm>
@@ -104,9 +105,9 @@ public:
         if (pass_) { reset(); return true; }
         const double down = std::min(1.0, ratio);
         const double fc = 0.5 * down * 0.97;
-        half_ = (int)std::ceil(16.0 / down);
+        half_ = (int)std::ceil((down < 1.0 ? 16.0 : 8.0) / down);   // decimating needs the long kernel against aliasing from beside the channel; at or above the input rate the 69 % wide channel leaves a wide transition band
         taps_ = 2 * half_;
-        stride_ = (taps_ + 3) & ~3;
+        stride_ = (taps_ + 7) & ~7;   // a multiple of the vector width of the shared loop
         bank_.assign((size_t)(phases_ + 1) * (size_t)stride_, 0.f);
         const double beta = 8.0, i0b = besselI0(beta);
         std::vector<double> t((size_t)taps_);
@@ -141,17 +142,11 @@ public:
         im_.resize(old + n);
         for (size_t i = 0; i < n; i++) { re_[old + i] = in[i].real(); im_[old + i] = in[i].imag(); }
         const long avail = (long)re_.size();
-        out.reserve(out.size() + (size_t)((double)n / step_) + 2);
-        for (;;) {
-            const long i0 = (long)std::floor(pos_);
-            const long base = i0 - (half_ - 1);
-            if (base + stride_ > avail) break;   // the dot product runs over the padded length
-            const int p = (int)std::lround((pos_ - (double)i0) * phases_);
-            float s[2];
-            genutil::dot2(&bank_[(size_t)p * (size_t)stride_], &re_[(size_t)base], &im_[(size_t)base], stride_, s);
-            out.push_back(cf32(s[0], s[1]));
-            pos_ += step_;
-        }
+        const double endPos = (double)(avail - stride_ + half_);   // outputs are made while pos < endPos: the dot product still fits in the input
+        const size_t first = out.size();
+        out.resize(first + (size_t)std::max(0.0, std::ceil((endPos - pos_) / step_)) + 2);
+        const size_t produced = resampleLoop(re_.data(), im_.data(), bank_.data(), stride_, phases_, half_ - 1, avail, pos_, step_, out.data() + first);
+        out.resize(first + produced);
         const long keepFrom = (long)std::floor(pos_) - (half_ - 1);
         if (keepFrom > 4096) {
             re_.erase(re_.begin(), re_.begin() + keepFrom);

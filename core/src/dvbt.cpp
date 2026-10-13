@@ -8,6 +8,10 @@
 #include <thread>
 #if defined(__SSE2__) && !defined(__ARM_NEON) && !defined(DECT2_NO_SIMD)
 #include <emmintrin.h>
+#if defined(__GNUC__) && defined(__x86_64__)
+#include <immintrin.h>
+#define DECT2_VIT_AVX2 1
+#endif
 #endif
 #if defined(__ARM_NEON) && !defined(DECT2_NO_SIMD)
 #include <arm_neon.h>
@@ -837,7 +841,7 @@ inline int16_t maxLane(__m128i v) {
     return (int16_t)_mm_cvtsi128_si32(v);
 }
 
-void viterbiRange(const int8_t* soft, size_t steps, std::vector<uint8_t>& bits, long* metricOut) {
+void viterbiRangeSse(const int8_t* soft, size_t steps, std::vector<uint8_t>& bits, long* metricOut) {
     const SseTables& T = sseTables();
     std::vector<uint64_t> dec(steps);
     long off = 0; // total subtracted by the renormalisation: the absolute path metric is off + pm
@@ -884,6 +888,77 @@ void viterbiRange(const int8_t* soft, size_t steps, std::vector<uint8_t>& bits, 
         state = ((state & 31) << 1) | b;
     }
     if (metricOut) *metricOut = off + bm;
+}
+#ifdef DECT2_VIT_AVX2
+// The same trellis with 256-bit registers (16 states each): identical decisions and metrics, half the instructions.
+__attribute__((target("avx2")))
+inline void deinterleave256(const __m256i x0, const __m256i x1, __m256i& A, __m256i& B) {
+    // packs works within the 128-bit halves, so the quarters come out as 0 2 1 3 and are put back in order
+    const __m256i a = _mm256_packs_epi32(_mm256_srai_epi32(_mm256_slli_epi32(x0, 16), 16), _mm256_srai_epi32(_mm256_slli_epi32(x1, 16), 16));
+    const __m256i b = _mm256_packs_epi32(_mm256_srai_epi32(x0, 16), _mm256_srai_epi32(x1, 16));
+    A = _mm256_permute4x64_epi64(a, 0xD8);
+    B = _mm256_permute4x64_epi64(b, 0xD8);
+}
+// the comparison results of two registers (32 lanes) as 32 bits, lane i to bit i
+__attribute__((target("avx2")))
+inline uint32_t maskBits256(__m256i m0, __m256i m1) {
+    return (uint32_t)_mm256_movemask_epi8(_mm256_permute4x64_epi64(_mm256_packs_epi16(m0, m1), 0xD8));
+}
+
+__attribute__((target("avx2")))
+void viterbiRangeAvx2(const int8_t* soft, size_t steps, std::vector<uint8_t>& bits, long* metricOut) {
+    const SseTables& T = sseTables();
+    std::vector<uint64_t> dec(steps);
+    long off = 0;
+    alignas(32) int16_t pm[64] = {};
+    const __m256i sigX0 = _mm256_loadu_si256((const __m256i*)T.sigX), sigX1 = _mm256_loadu_si256((const __m256i*)(T.sigX + 16));
+    const __m256i sigY0 = _mm256_loadu_si256((const __m256i*)T.sigY), sigY1 = _mm256_loadu_si256((const __m256i*)(T.sigY + 16));
+    __m256i N0 = _mm256_setzero_si256(), N1 = N0, N2 = N0, N3 = N0;   // states 0-15, 16-31, 32-47, 48-63
+    for (size_t t = 0; t < steps; t++) {
+        const __m256i a = _mm256_set1_epi16(soft[2 * t]), b = _mm256_set1_epi16(soft[2 * t + 1]);
+        __m256i A0, B0, A1, B1;
+        deinterleave256(N0, N1, A0, B0);   // old states 0-31: new states 0-15 and 32-47
+        deinterleave256(N2, N3, A1, B1);   // old states 32-63: new states 16-31 and 48-63
+        const __m256i M0 = _mm256_add_epi16(_mm256_mullo_epi16(sigX0, a), _mm256_mullo_epi16(sigY0, b));
+        const __m256i M1 = _mm256_add_epi16(_mm256_mullo_epi16(sigX1, a), _mm256_mullo_epi16(sigY1, b));
+        const __m256i p00 = _mm256_adds_epi16(A0, M0), p10 = _mm256_subs_epi16(B0, M0);
+        const __m256i r00 = _mm256_subs_epi16(A0, M0), r10 = _mm256_adds_epi16(B0, M0);
+        const __m256i p01 = _mm256_adds_epi16(A1, M1), p11 = _mm256_subs_epi16(B1, M1);
+        const __m256i r01 = _mm256_subs_epi16(A1, M1), r11 = _mm256_adds_epi16(B1, M1);
+        __m256i n0 = _mm256_max_epi16(p00, p10), n1 = _mm256_max_epi16(p01, p11);
+        __m256i n2 = _mm256_max_epi16(r00, r10), n3 = _mm256_max_epi16(r01, r11);
+        dec[t] = (uint64_t)maskBits256(_mm256_cmpgt_epi16(p10, p00), _mm256_cmpgt_epi16(p11, p01))
+               | (uint64_t)maskBits256(_mm256_cmpgt_epi16(r10, r00), _mm256_cmpgt_epi16(r11, r01)) << 32;
+        if ((t & 3) == 3) {
+            __m256i mx = _mm256_max_epi16(_mm256_max_epi16(n0, n1), _mm256_max_epi16(n2, n3));
+            const int16_t top = maxLane(_mm_max_epi16(_mm256_castsi256_si128(mx), _mm256_extracti128_si256(mx, 1)));
+            off += top;
+            const __m256i m = _mm256_set1_epi16(top);
+            n0 = _mm256_sub_epi16(n0, m); n1 = _mm256_sub_epi16(n1, m); n2 = _mm256_sub_epi16(n2, m); n3 = _mm256_sub_epi16(n3, m);
+        }
+        N0 = n0; N1 = n1; N2 = n2; N3 = n3;
+    }
+    _mm256_store_si256((__m256i*)pm, N0); _mm256_store_si256((__m256i*)(pm + 16), N1);
+    _mm256_store_si256((__m256i*)(pm + 32), N2); _mm256_store_si256((__m256i*)(pm + 48), N3);
+    int state = 0;
+    int bm = pm[0];
+    for (int s = 1; s < 64; s++) if (pm[s] > bm) { bm = pm[s]; state = s; }
+    bits.assign(steps, 0);
+    for (size_t t = steps; t-- > 0;) {
+        bits[t] = (uint8_t)(state >> 5);
+        const int b = (int)((dec[t] >> state) & 1);
+        state = ((state & 31) << 1) | b;
+    }
+    if (metricOut) *metricOut = off + bm;
+}
+#endif
+
+void viterbiRange(const int8_t* soft, size_t steps, std::vector<uint8_t>& bits, long* metricOut) {
+#ifdef DECT2_VIT_AVX2
+    static const bool avx2 = __builtin_cpu_supports("avx2");
+    if (avx2) return viterbiRangeAvx2(soft, steps, bits, metricOut);
+#endif
+    viterbiRangeSse(soft, steps, bits, metricOut);
 }
 #else
 void viterbiRange(const int8_t* soft, size_t steps, std::vector<uint8_t>& bits, long* metricOut) {
