@@ -255,4 +255,162 @@ bool LdpcCode::decodeFast(const std::vector<float>& llr, int maxIter, std::vecto
     return decodeFastBody(llr, maxIter, hard, iters, alpha);
 }
 
+// ---- the same layered decoder on 8-bit values
+// Ranges keep every stored value inside int8: posteriors are clamped to +-96, messages are +-31, so "posterior - old message" is at most 127; the
+// sum "posterior + (new - old message)" is made in int and clamped.
+
+namespace {
+constexpr int kQMax = 96, kQMsg = 31;
+
+DECT2_SIMD_BODY void q8Accumulate(const int8_t* __restrict Lj, int8_t* __restrict min1, int8_t* __restrict min2, int8_t* __restrict idx1,
+                                  int8_t* __restrict sg, int8_t j, int Z) {
+    for (int m = 0; m < Z; m++) {
+        const int8_t x = Lj[m], a = x < 0 ? (int8_t)-x : x;
+        const int8_t m1 = min1[m], m2 = min2[m];
+        const bool lt = a < m1;
+        min2[m] = lt ? m1 : (a < m2 ? a : m2);
+        idx1[m] = lt ? j : idx1[m];
+        min1[m] = lt ? a : m1;
+        sg[m] ^= x;                       // only the sign bit is used
+    }
+}
+DECT2_SIMD_BODY void q8Apply(const int8_t* __restrict Lj, int8_t* __restrict mj, int8_t* __restrict inc, const int8_t* __restrict min1,
+                             const int8_t* __restrict min2, const int8_t* __restrict idx1, const int8_t* __restrict sg, int j, int Z) {
+    for (int m = 0; m < Z; m++) {
+        const int x = Lj[m];
+        const int a1 = min1[m], a2 = min2[m];
+        int mag = idx1[m] == j ? a2 : a1;
+        mag = (mag * 13 + 8) >> 4;                         // normalised min-sum, 13/16
+        mag = mag > kQMsg ? kQMsg : mag;
+        const int neg = (sg[m] ^ x) >> 7;                  // -1 where the message is negative
+        const int8_t nm = (int8_t)((mag ^ neg) - neg);
+        inc[m] = (int8_t)(nm - mj[m]);
+        mj[m] = nm;
+    }
+}
+DECT2_SIMD_BODY void q8Xor(int8_t* __restrict dst, const int8_t* __restrict src, int n) {
+    for (int m = 0; m < n; m++) dst[m] ^= src[m];
+}
+DECT2_SIMD_BODY void q8Add(int8_t* __restrict dst, const int8_t* __restrict inc, int n) {
+    for (int m = 0; m < n; m++) {
+        const int v = dst[m] + inc[m];
+        dst[m] = (int8_t)(v > kQMax ? kQMax : (v < -kQMax ? -kQMax : v));
+    }
+}
+} // namespace
+
+DECT2_SIMD_MEMBER_BODY bool LdpcCode::decodeQ8Body(const std::vector<float>& llr, int maxIter, std::vector<uint8_t>& hard, int* iters, float, int* unsat) const {
+    constexpr int Z = 360;
+    const int q = q_, G = groups_;
+    // the scale: the mean magnitude of the input becomes about 8 (the min-sum decoder does not care about the scale, only about the resolution)
+    float sum = 0;
+    for (int i = 0; i < n_; i++) sum += std::fabs(llr[(size_t)i]);
+    const float scale = sum > 0 ? 16.f * (float)n_ / sum : 1.f;
+    auto quant = [&](float v) { const float t = std::nearbyint(v * scale); return (int8_t)(t > kQMsg ? kQMsg : (t < -kQMsg ? -kQMsg : t)); };
+    std::vector<int8_t> inf((size_t)G * Z), par((size_t)q * (Z + 1));
+    auto P = [&](int r) { return par.data() + (size_t)r * (Z + 1) + 1; };
+    for (int i = 0; i < G * Z; i++) inf[(size_t)i] = quant(llr[(size_t)i]);
+    for (int r = 0; r < q; r++) {
+        int8_t* p = P(r);
+        p[-1] = kQMax;
+        for (int m = 0; m < Z; m++) p[m] = quant(llr[(size_t)(k_ + r + q * m)]);
+    }
+    std::vector<size_t> base((size_t)q + 1, 0);
+    for (int r = 0; r < q; r++) base[(size_t)r + 1] = base[(size_t)r] + (layers_[(size_t)r].size() + 2) * Z;
+    std::vector<int8_t> msg(base[(size_t)q], 0);
+    std::vector<int8_t> L, inc, min1(Z), min2(Z), idx1(Z), sg(Z);
+    int it = 0, bad = 0;
+    bool ok = false;
+    // checks that fail, layer by layer (the 360 checks of a layer together: the sign bits of its variables, rotated, xor-ed); `all` false stops at the first
+    std::vector<int8_t> acc(Z);
+    auto syndrome = [&](bool all) {
+        int n = 0;
+        for (int r = 0; r < q; r++) {
+            const auto& cn = layers_[(size_t)r];
+            std::copy(P(r), P(r) + Z, acc.begin());
+            if (r > 0) q8Xor(acc.data(), P(r - 1), Z);
+            else { q8Xor(acc.data() + 1, P(q - 1), Z - 1); }
+            for (const auto& c : cn) {
+                const int8_t* src = inf.data() + (size_t)c.group * Z;
+                q8Xor(acc.data() + c.shift, src, Z - c.shift);
+                q8Xor(acc.data(), src + (Z - c.shift), c.shift);
+            }
+            for (int m = 0; m < Z; m++) n += acc[(size_t)m] < 0;
+            if (n && !all) return n;
+        }
+        return n;
+    };
+    for (; it < maxIter; it++) {
+        for (int r = 0; r < q; r++) {
+            const auto& cn = layers_[(size_t)r];
+            const int nc = (int)cn.size() + 2;
+            L.assign((size_t)nc * Z, 0);
+            inc.assign((size_t)nc * Z, 0);
+            int8_t* mr = msg.data() + base[(size_t)r];
+            for (int j = 0; j < nc; j++) {
+                int8_t* Lj = L.data() + (size_t)j * Z;
+                const int8_t* mj = mr + (size_t)j * Z;
+                if (j < (int)cn.size()) {
+                    const int8_t* src = inf.data() + (size_t)cn[(size_t)j].group * Z;
+                    const int s = cn[(size_t)j].shift;
+                    for (int m = s; m < Z; m++) Lj[m] = (int8_t)(src[m - s] - mj[m]);
+                    for (int m = 0; m < s; m++) Lj[m] = (int8_t)(src[m - s + Z] - mj[m]);
+                } else {
+                    const int8_t* src = (j == (int)cn.size()) ? P(r) : (r > 0 ? P(r - 1) : P(q - 1) - 1);
+                    for (int m = 0; m < Z; m++) Lj[m] = (int8_t)(src[m] - mj[m]);
+                }
+            }
+            for (int m = 0; m < Z; m++) { min1[(size_t)m] = 127; min2[(size_t)m] = 127; idx1[(size_t)m] = -1; sg[(size_t)m] = 0; }
+            for (int j = 0; j < nc; j++) q8Accumulate(L.data() + (size_t)j * Z, min1.data(), min2.data(), idx1.data(), sg.data(), (int8_t)j, Z);
+            for (int j = 0; j < nc; j++) {
+                int8_t* incj = inc.data() + (size_t)j * Z;
+                q8Apply(L.data() + (size_t)j * Z, mr + (size_t)j * Z, incj, min1.data(), min2.data(), idx1.data(), sg.data(), (int8_t)j, Z);
+                if (j < (int)cn.size()) {
+                    int8_t* dst = inf.data() + (size_t)cn[(size_t)j].group * Z;
+                    const int s = cn[(size_t)j].shift;
+                    q8Add(dst, incj + s, Z - s);
+                    q8Add(dst + (Z - s), incj, s);
+                } else {
+                    int8_t* dst = (j == (int)cn.size()) ? P(r) : (r > 0 ? P(r - 1) : P(q - 1) - 1);
+                    q8Add(dst, incj, Z);
+                }
+            }
+            P(q - 1)[-1] = kQMax;
+        }
+        bad = syndrome(false);
+        ok = bad == 0;
+        if (ok) { it++; break; }
+    }
+    hard.assign((size_t)n_, 0);
+    for (int i = 0; i < G * Z; i++) hard[(size_t)i] = inf[(size_t)i] < 0;
+    for (int r = 0; r < q; r++) for (int m = 0; m < Z; m++) hard[(size_t)(k_ + r + q * m)] = P(r)[m] < 0;
+    if (iters) *iters = it;
+    if (!ok) bad = syndrome(true);
+    if (unsat) *unsat = bad;
+    return ok;
+}
+
+#if defined(DECT2_X86_DISPATCH)
+DECT2_AVX2_TARGET bool LdpcCode::decodeQ8Avx2(const std::vector<float>& llr, int maxIter, std::vector<uint8_t>& hard, int* iters, float alpha, int* unsat) const {
+    return decodeQ8Body(llr, maxIter, hard, iters, alpha, unsat);
+}
+#endif
+
+bool LdpcCode::decodeFast8(const std::vector<float>& llr, int maxIter, std::vector<uint8_t>& hard, int* iters, float alpha) const {
+    int unsat = 0, it8 = 0;
+#if defined(DECT2_X86_DISPATCH)
+    bool ok = cpuHasAvx2() ? decodeQ8Avx2(llr, maxIter, hard, &it8, alpha, &unsat) : decodeQ8Body(llr, maxIter, hard, &it8, alpha, &unsat);
+#else
+    bool ok = decodeQ8Body(llr, maxIter, hard, &it8, alpha, &unsat);
+#endif
+    if (iters) *iters = it8;
+    // the float decoder only for a frame that is close: a damaged one has a large part of its checks unsatisfied
+    if (!ok && unsat * 8 <= m_) {
+        int it = 0;
+        ok = decodeFast(llr, maxIter, hard, &it, alpha);
+        if (iters) *iters = it8 + it;
+    }
+    return ok;
+}
+
 } // namespace dect2

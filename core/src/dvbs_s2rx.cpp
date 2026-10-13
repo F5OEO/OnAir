@@ -844,7 +844,10 @@ struct S2Rx::Impl {
                 s2Demap(j.syms.data(), d.xfecSymbols, j.mod, j.rate, j.sigma2, llr.data());
                 s2BitDeinterleaveLlr(llr.data(), d.nldpc, j.mod, j.rate, dl.data());
                 int iters = 0;
-                const bool ldpcOk = s2Ldpc(j.rate, j.sh).decodeFast(dl, 50, hard, &iters, s2LdpcAlpha(j.rate));
+                // the high code rates converge in a few iterations, where the 8-bit decoder is about twice as fast; the low rates need as many iterations
+                // again with it, so they keep the float one
+                const LdpcCode& code = s2Ldpc(j.rate, j.sh);
+                const bool ldpcOk = s2RateValue(j.rate) >= 0.7 ? code.decodeFast8(dl, 50, hard, &iters) : code.decodeFast(dl, 50, hard, &iters, s2LdpcAlpha(j.rate));
                 r.iters = iters;
                 if (ldpcOk) {
                     const int fixed = s2BchDecode(hard.data(), j.rate, j.sh, bb);

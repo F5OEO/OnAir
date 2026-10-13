@@ -296,7 +296,8 @@ int main() {
             {0, 0, 0, 0, 0, 0, 12.73, 13.64, 14.28, 15.69, 16.05}};
         std::normal_distribution<float> nd(0.f, 1.f);
         int frames = 0, bad = 0;
-        double totalMs = 0, itSum = 0;
+        double totalMs = 0, itSum = 0, ms8 = 0, msF = 0, it8Sum = 0;
+        int bad8 = 0;
         for (int sh = 0; sh < 2; sh++)
             for (int mo = 0; mo < 4; mo++)
                 for (int r = 0; r < kS2Rates; r++) {
@@ -312,9 +313,11 @@ int main() {
                     std::vector<uint8_t> fec, il;
                     s2EncodeFec(scr, r, sh, fec);
                     s2BitInterleave(fec, mo, r, il);
+                    const int reps = getenv("S2FEC_REP") ? atoi(getenv("S2FEC_REP")) : 1;   // S2FEC_REP and S2FEC_DB: a margin test of both decoders
+                    for (int rep = 0; rep < reps; rep++) {
                     std::vector<cf32> sym(d.xfecSymbols);
                     s2MapBits(il.data(), d.nldpc, mo, r, sym.data());
-                    const double es = qef[mo][r] + (sh ? 1.3 : 0.9);
+                    const double es = qef[mo][r] + (sh ? 1.3 : 0.9) + (getenv("S2FEC_DB") ? atof(getenv("S2FEC_DB")) : 0.0);   // S2FEC_DB: less margin, to compare the decoders
                     const double sigma2 = std::pow(10.0, -es / 10.0) / 2.0;
                     for (auto& s : sym) s += cf32(nd(rng), nd(rng)) * (float)std::sqrt(sigma2);
                     auto t0 = std::chrono::steady_clock::now();
@@ -328,12 +331,32 @@ int main() {
                     const int fixed = ok ? s2BchDecode(hard.data(), r, sh, out) : -1;
                     totalMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                     itSum += iters;
+                    {   // the 8-bit decoder on the same input
+                        std::vector<uint8_t> h8;
+                        int i8 = 0;
+                        auto a0 = std::chrono::steady_clock::now();
+                        const bool ok8 = s2Ldpc(r, sh).decodeFast8(dl, 50, h8, &i8, s2LdpcAlpha(r));
+                        ms8 += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a0).count();
+                        a0 = std::chrono::steady_clock::now();
+                        std::vector<uint8_t> hf; int jf = 0;
+                        s2Ldpc(r, sh).decodeFast(dl, 50, hf, &jf, s2LdpcAlpha(r));
+                        msF += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a0).count();
+                        std::vector<uint8_t> o8;
+                        const int f8 = ok8 ? s2BchDecode(h8.data(), r, sh, o8) : -1;
+                        if ((int)o8.size() == d.kbch) s2BbScramble(o8.data(), d.kbch);
+                        const bool g8 = f8 >= 0 && o8 == bb;
+                        if (!g8) { bad8++; if (getenv("S2FEC_VERBOSE")) printf("  8-bit failed: %s %s %s\n", sh ? "short" : "normal", s2ModName(mo), s2RateName(r)); }
+                        it8Sum += i8;
+                        if (getenv("S2FEC_VERBOSE")) printf("  %s %s %s: float %d it, 8-bit %d it %s\n", sh ? "short" : "normal", s2ModName(mo), s2RateName(r), iters, i8, g8 ? "ok" : "FAILED");
+                    }
                     frames++;
                     if ((int)out.size() == d.kbch) s2BbScramble(out.data(), d.kbch);
                     const bool good = fixed >= 0 && out == bb;
                     if (!good) bad++;
                     CHECK(good, "%s %s %s frame: Es/N0 %.2f dB (QEF %.2f): LDPC %s, BCH %d", sh ? "short" : "normal", s2ModName(mo), s2RateName(r), es, qef[mo][r], ok ? "ok" : "failed", fixed);
+                    }
                 }
+        printf("8-bit LDPC: %d failed of %d, mean iterations %.1f (float %.1f), %.2f ms per frame (float %.2f)\n", bad8, frames, it8Sum / frames, itSum / frames, ms8 / frames, msF / frames);
         printf("round trip: %d frames, %d failed, mean LDPC iterations %.1f, %.1f ms per frame (demap + decode)\n", frames, bad, itSum / frames, totalMs / frames);
     }
     printf(fails ? "dvbs s2fec: FAILED\n" : "dvbs s2fec: ok\n");
